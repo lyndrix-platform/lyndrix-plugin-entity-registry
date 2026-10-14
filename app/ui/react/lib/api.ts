@@ -154,3 +154,38 @@ export const registryApi = {
   getCatalog: () => apiFetch<Catalog>(base('catalog')),
   getStats: () => apiFetch<Stats>(base('stats')),
 }
+
+// ─── ITSM plugin (best effort) ────────────────────────────────────────────────
+// The ITSM plugin is optional. Any failure (plugin absent, no permission,
+// network) yields `null` and the registry UI simply hides the section.
+
+const ITSM_ID = 'lyndrix.plugin.itsm'
+const ITSM_ROUTE = '/apps/lyndrix-plugin-itsm/itsm'
+
+export interface ItsmRecordSummary {
+  uuid: string
+  number: string
+  title: string
+  record_type: string
+  state: string
+  priority: string | null
+}
+
+export const itsmApi = {
+  /** Open (non-closed) records that reference this configuration item. */
+  recordsForCi: async (uuid: string): Promise<ItsmRecordSummary[] | null> => {
+    try {
+      const res = await apiFetch<{ records: ItsmRecordSummary[] }>(
+        `/api/plugins/${ITSM_ID}/records?ci=${encodeURIComponent(uuid)}&limit=50`,
+      )
+      return res.records
+    } catch {
+      return null
+    }
+  },
+  recordLink: (recordUuid: string) => `${ITSM_ROUTE}?record=${encodeURIComponent(recordUuid)}`,
+  newIncidentLink: (ci: string) => `${ITSM_ROUTE}?new=incident&ci=${encodeURIComponent(ci)}`,
+  allForCiLink: (ci: string) => `${ITSM_ROUTE}?ci=${encodeURIComponent(ci)}`,
+}
+
+export { spaRedirect }

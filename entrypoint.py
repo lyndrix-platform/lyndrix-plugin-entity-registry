@@ -25,6 +25,11 @@ Events consumed
                                round-trip.
   entity_registry:register   — {uuid, entity_type, display_name, identifiers?,
                                 attributes?, source}  (bring-your-own UUID)
+  entity_registry:lookup     — {ref, entity_type?, request_id} or
+                               {scheme, value, request_id}. Read-only resolve of
+                               a UUID / scheme:value / identifier value / display
+                               name. Reply on entity_registry:lookup_result:
+                               {request_id, ok, entity|null, match, candidates}.
   entity_registry:relate     — {from_uuid, to_uuid, relation, source?}
   entity_registry:unrelate   — {from_uuid, to_uuid, relation}
   entity_registry:retire     — {uuid, source?}
@@ -32,6 +37,7 @@ Events consumed
 Events emitted
 --------------
   entity_registry:identified     — reply to identify (see above)
+  entity_registry:lookup_result  — reply to lookup (see above)
   entity_registry:entity_created — {entity}
   entity_registry:entity_updated — {entity, changes}
   entity_registry:entity_merged  — {keep, drop_uuid}
@@ -78,12 +84,14 @@ manifest = ModuleManifest(
             "db:connected",
             "entity_registry:identify",
             "entity_registry:register",
+            "entity_registry:lookup",
             "entity_registry:relate",
             "entity_registry:unrelate",
             "entity_registry:retire",
         ],
         "emit": [
             "entity_registry:identified",
+            "entity_registry:lookup_result",
             "entity_registry:entity_created",
             "entity_registry:entity_updated",
             "entity_registry:entity_merged",
@@ -217,6 +225,35 @@ def setup(ctx):
             )
         except Exception as exc:
             _fail(topic, payload, str(exc))
+
+    @ctx.subscribe("entity_registry:lookup")
+    async def _on_lookup(payload):
+        """Read-only resolve for other plugins (ITSM CI links, event correlation)."""
+        topic = "entity_registry:lookup"
+        if not isinstance(payload, dict):
+            _fail(topic, payload, "payload must be an object")
+            return
+        request_id = payload.get("request_id")
+        reply: dict = {"request_id": request_id}
+        ref = payload.get("ref") or payload.get("uuid")
+        if payload.get("scheme") and payload.get("value"):
+            ref = f"{payload['scheme']}:{payload['value']}"
+        if not svc.is_ready:
+            reply.update(ok=False, error="database not ready")
+        elif not ref:
+            reply.update(ok=False, error="ref (uuid, scheme:value, identifier value or name) required")
+        else:
+            try:
+                res = await asyncio.to_thread(
+                    svc.resolve, str(ref), entity_type=payload.get("entity_type")
+                )
+                reply.update(ok=True, **res)
+            except Exception as exc:
+                reply.update(ok=False, error=str(exc))
+        if request_id is not None:
+            ctx.emit("entity_registry:lookup_result", reply)
+        elif not reply.get("ok"):
+            _fail(topic, payload, str(reply.get("error")))
 
     @ctx.subscribe("entity_registry:relate")
     async def _on_relate(payload):

@@ -199,6 +199,18 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"No entity for {scheme}={value}")
         return {"entity": entity}
 
+    @router.get("/resolve")
+    async def resolve(
+        ref: str = Query(min_length=1, max_length=255),
+        type: Optional[str] = None,  # noqa: A002 — query param name
+        identity: ApiIdentity = Depends(require_permission(PERM_READ)),
+    ):
+        """Resolve a UUID, ``scheme:value``, identifier value or display name to
+        one entity. Always 200: ``entity`` is null when nothing (or more than one
+        thing) matched and ``candidates`` lists the near-misses."""
+        _ensure_ready()
+        return await _call(service.resolve, ref, entity_type=type)
+
     # ── Relations ──────────────────────────────────────────────────────────────
     @router.post("/entities/{uuid}/relations")
     async def add_relation(

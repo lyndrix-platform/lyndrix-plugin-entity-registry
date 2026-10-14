@@ -2,8 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 // Provided by the host shell (window.__lyndrix_react_i18next); strings come
 // from locales/entity_registry.<locale>.json (namespace "entity_registry").
 import { useTranslation } from 'react-i18next'
-import { registryApi } from './lib/api'
-import type { Catalog, Conflict, Entity, Stats } from './lib/api'
+import { itsmApi, registryApi, spaRedirect } from './lib/api'
+import type { Catalog, Conflict, Entity, ItsmRecordSummary, Stats } from './lib/api'
 
 // ─── Small shared pieces ──────────────────────────────────────────────────────
 
@@ -239,6 +239,8 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
   const [relTo, setRelTo] = useState('')
   const [relKind, setRelKind] = useState('')
   const [confirmRetire, setConfirmRetire] = useState(false)
+  // ITSM records referencing this CI: undefined = loading, null = ITSM not available.
+  const [itsm, setItsm] = useState<ItsmRecordSummary[] | null | undefined>(undefined)
 
   const load = useCallback(async () => {
     setError(null)
@@ -251,6 +253,7 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
   }, [uuid])
 
   useEffect(() => { void load() }, [load])
+  useEffect(() => { setItsm(undefined); void itsmApi.recordsForCi(uuid).then(setItsm) }, [uuid])
 
   async function run(fn: () => Promise<unknown>) {
     setBusy(true)
@@ -360,6 +363,34 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
                 onClick={() => void run(async () => { await registryApi.addRelation(entity.uuid, relTo.trim(), relKind); setRelTo('') })} />
             </div>
           </div>
+
+          {itsm !== null && (
+            <div className="lx-card" style={{ padding: '1rem' }}>
+              <div className="lx-section-title">{t('detail.itsm', { defaultValue: 'Service management' })}</div>
+              <p style={{ fontSize: '0.78rem', color: 'var(--lx-text-muted)', margin: '0 0 0.5rem' }}>
+                {t('detail.itsmHint', { defaultValue: 'Records in the ITSM plugin that reference this configuration item.' })}
+              </p>
+              {itsm === undefined ? (
+                <span className="lx-spinner" />
+              ) : itsm.length === 0 ? (
+                <div style={{ fontSize: '0.8rem', color: 'var(--lx-text-muted)' }}>{t('detail.itsmNone', { defaultValue: 'No open records for this configuration item.' })}</div>
+              ) : (
+                itsm.map((r) => (
+                  <div key={r.uuid} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.8rem', padding: '0.2rem 0' }}>
+                    <a href={itsmApi.recordLink(r.uuid)} onClick={(e) => { e.preventDefault(); spaRedirect(itsmApi.recordLink(r.uuid)) }} className="lx-mono" style={{ color: 'var(--lx-accent)', fontWeight: 600, whiteSpace: 'nowrap' }}>{r.number}</a>
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.title}</span>
+                    <span className="lx-badge lx-badge--muted">{r.state}</span>
+                    {r.priority && <span className="lx-badge lx-badge--muted">{r.priority}</span>}
+                  </div>
+                ))
+              )}
+              <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.6rem', flexWrap: 'wrap' }}>
+                <Button label={t('detail.itsmNewIncident', { defaultValue: 'New incident' })} icon="support_agent" variant="primary" disabled={entity.status !== 'active'}
+                  onClick={() => spaRedirect(itsmApi.newIncidentLink(entity.uuid))} />
+                <Button label={t('detail.itsmAll', { defaultValue: 'All records' })} icon="list" onClick={() => spaRedirect(itsmApi.allForCiLink(entity.uuid))} />
+              </div>
+            </div>
+          )}
 
           <div className="lx-card" style={{ padding: '1rem' }}>
             <div className="lx-section-title">{t('detail.actions', { defaultValue: 'Actions' })}</div>

@@ -53,7 +53,12 @@
     "dropUuid": "UUID der Entität, die in diese zusammengeführt wird",
     "merge": "In diese zusammenführen",
     "retire": "Stilllegen",
-    "retireConfirm": "Stilllegen bestätigen"
+    "retireConfirm": "Stilllegen bestätigen",
+    "itsm": "Service Management",
+    "itsmHint": "Datensätze im ITSM-Plugin, die dieses Configuration Item referenzieren.",
+    "itsmNone": "Keine offenen Datensätze zu diesem Configuration Item.",
+    "itsmNewIncident": "Neuer Incident",
+    "itsmAll": "Alle Datensätze"
   },
   "conflicts": {
     "title": "Offene Konflikte",

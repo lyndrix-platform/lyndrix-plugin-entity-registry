@@ -94,6 +94,7 @@ Basis: `/api/plugins/lyndrix.plugin.entity_registry/` (authentifiziert; Rechte
 | `POST` | `/entities/{uuid}/retire` | stilllegen (ein erneutes `identify` reaktiviert) |
 | `POST` | `/entities/{uuid}/merge` | `{drop_uuid}` in diese Entität zusammenführen |
 | `GET` | `/lookup?scheme=&value=` | Entität zu einem Identifier |
+| `GET` | `/resolve?ref=&type=` | Eine Referenz zu **genau einer** Entität auflösen: UUID (folgt Merge-Tombstones), `schema:wert` (`pve.vm:hydra/8003`), reiner Identifier-Wert (`docker-hydra`) oder Anzeigename. Antwort immer 200: `{entity\|null, match, candidates}` — bei Mehrdeutigkeit `entity: null`, `match: "ambiguous"` und die Kandidaten; es wird nie geraten und nie angelegt |
 | `POST` / `DELETE` | `/entities/{uuid}/relations[/{relation}/{to_uuid}]` | Beziehungen |
 | `GET` | `/conflicts?status=open` | Konfliktliste |
 | `POST` | `/conflicts/{id}/dismiss` | Konflikt verwerfen („das sind wirklich zwei Dinge“) |
@@ -108,6 +109,7 @@ Basis: `/api/plugins/lyndrix.plugin.entity_registry/` (authentifiziert; Rechte
 |---|---|---|
 | `entity_registry:identify` | `{entity_type, identifiers, display_name?, attributes?, source, request_id?}` oder `{items: [...], request_id?}` | Antwort auf `entity_registry:identified` mit demselben `request_id`: `{ok, uuid, created, conflict}` bzw. `{ok, results: [...]}` |
 | `entity_registry:register` | `{uuid, entity_type, display_name, identifiers?, attributes?, source}` | Bring-your-own-UUID |
+| `entity_registry:lookup` | `{ref, entity_type?, request_id}` oder `{scheme, value, request_id}` | Nur-Lese-Auflösung wie `GET /resolve`; Antwort auf `entity_registry:lookup_result`: `{request_id, ok, entity\|null, match, candidates}`. So löst z. B. das ITSM-Plugin `docker-hydra` zur CI-UUID auf |
 | `entity_registry:relate` / `unrelate` | `{from_uuid, to_uuid, relation, source?}` | Beziehung anlegen / entfernen |
 | `entity_registry:retire` | `{uuid, source?}` | stilllegen |
 
@@ -118,9 +120,9 @@ UUID weiter und holt sie beim nächsten Sync nach.
 
 ### Emittiert
 
-`entity_registry:identified` (Antwort), `entity_created`, `entity_updated` (`{entity, changes}`),
-`entity_merged` (`{keep, drop_uuid}`), `entity_retired`, `conflict`, `ingest_failed`
-(`{topic, error, payload_keys}` — Fehler bei Pushes ohne `request_id`).
+`entity_registry:identified` und `entity_registry:lookup_result` (Antworten), `entity_created`,
+`entity_updated` (`{entity, changes}`), `entity_merged` (`{keep, drop_uuid}`), `entity_retired`,
+`conflict`, `ingest_failed` (`{topic, error, payload_keys}` — Fehler bei Pushes ohne `request_id`).
 
 ## Rollen
 
@@ -135,6 +137,12 @@ Route `/registry` (im Shell unter `/apps/lyndrix-plugin-entity_registry/registry
 eine Entität: `?uuid=<uuid>`. Ansichten: Liste mit Typ-/Status-Filter und Suche, Detail
 (Identifier, Attribute, Beziehungen, „gesehen von“, Merge, Stilllegen), Konfliktwarteschlange mit
 „Diese behalten, andere zusammenführen“ bzw. „Verwerfen“.
+
+Ist das ITSM-Plugin geladen, zeigt die Detailansicht zusätzlich die Karte **Service Management**:
+die offenen Datensätze, die dieses CI referenzieren (Link in den Datensatz), „Neuer Incident“
+(öffnet das ITSM-Formular mit dem CI als *betroffen* vorbelegt — `/apps/lyndrix-plugin-itsm/itsm?new=incident&ci=<uuid>`)
+und „Alle Datensätze“ (`?ci=<uuid>`). Ohne ITSM-Plugin oder -Berechtigung bleibt die Karte
+einfach weg.
 
 ## Entwicklung & Tests
 

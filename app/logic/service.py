@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -34,6 +35,7 @@ from .catalog import CatalogLoader
 log = get_logger("Plugin:EntityRegistry:Service")
 
 LIVE_STATUSES = ("active", "retired")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
 class RegistryError(ValueError):
@@ -220,6 +222,77 @@ class EntityRegistryService:
                 return None
             entity = self._resolve_live(s, ident.entity_uuid)
             return self._entity_detail(s, entity) if entity else None
+
+    def resolve(self, ref: str, *, entity_type: str | None = None, limit: int = 5) -> dict:
+        """Find the one entity a human or another plugin means by ``ref``.
+
+        ``ref`` may be a UUID (merge tombstones are followed), ``scheme:value``
+        for a catalog scheme, a bare identifier value (any scheme, e.g.
+        ``docker-hydra``) or a display name. Returns::
+
+            {"entity": detail | None, "match": "uuid" | "identifier" |
+             "display_name" | "ambiguous" | None, "candidates": [summary, ...]}
+
+        Several different entities for one ``ref`` are *never* guessed between:
+        ``entity`` stays None and ``candidates`` lists them so a UI can offer a
+        choice. Nothing is created here — that is ``identify()``'s job.
+        """
+        self._require_ready()
+        ref = (ref or "").strip()
+        if not ref:
+            raise RegistryError("ref is required")
+        with get_session() as s:
+            if _UUID_RE.match(ref):
+                entity = self._resolve_live(s, ref.lower())
+                if entity is not None and (entity_type is None or entity.entity_type == entity_type):
+                    return {"entity": self._entity_detail(s, entity), "match": "uuid", "candidates": []}
+                return {"entity": None, "match": None, "candidates": []}
+
+            # "scheme:value" — only when the prefix is a catalog scheme, so values
+            # such as FQDNs or 'hydra/8003' are never misread.
+            scheme, sep, value = ref.partition(":")
+            if sep and value and scheme in self.catalog.scheme_ids():
+                where = (Identifier.scheme == scheme, Identifier.value == value.strip())
+            else:
+                where = (Identifier.value == ref,)
+            hits: dict[str, Entity] = {}
+            for ident in s.execute(select(Identifier).where(*where)).scalars():
+                live = self._resolve_live(s, ident.entity_uuid)
+                if live is None or live.status != "active":
+                    continue
+                if entity_type and live.entity_type != entity_type:
+                    continue
+                hits[live.uuid] = live
+            if len(hits) == 1:
+                return {"entity": self._entity_detail(s, next(iter(hits.values()))),
+                        "match": "identifier", "candidates": []}
+            if len(hits) > 1:
+                return {"entity": None, "match": "ambiguous",
+                        "candidates": self._summaries(s, list(hits.values())[:limit])}
+
+            stmt = select(Entity).where(
+                Entity.status == "active", func.lower(Entity.display_name) == ref.lower()
+            )
+            if entity_type:
+                stmt = stmt.where(Entity.entity_type == entity_type)
+            named = s.execute(stmt).scalars().all()
+            if len(named) == 1:
+                return {"entity": self._entity_detail(s, named[0]), "match": "display_name",
+                        "candidates": []}
+            if len(named) > 1:
+                return {"entity": None, "match": "ambiguous",
+                        "candidates": self._summaries(s, named[:limit])}
+
+            near = self.list_entities(entity_type=entity_type, q=ref, limit=limit)["entities"]
+            return {"entity": None, "match": None, "candidates": near}
+
+    def _summaries(self, s, entities: list[Entity]) -> list[dict]:
+        uuids = [e.uuid for e in entities]
+        idents: dict[str, list[dict]] = {u: [] for u in uuids}
+        if uuids:
+            for i in s.execute(select(Identifier).where(Identifier.entity_uuid.in_(uuids))).scalars():
+                idents[i.entity_uuid].append(i.to_dict())
+        return [{**e.to_dict(), "identifiers": idents[e.uuid]} for e in entities]
 
     def get_stats(self) -> dict:
         self._require_ready()

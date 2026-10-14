@@ -228,3 +228,48 @@ def test_catalog_rejects_duplicates(tmp_path):
     )
     with pytest.raises(Exception, match="duplicate"):
         CatalogLoader(tmp_path).load()
+
+
+# ── resolve (read-only, for CI links) ──────────────────────────────────────────
+
+def test_resolve_by_uuid_identifier_scheme_and_name(svc):
+    uuid = _host(svc, key="docker-hydra", vm="hydra/8003")["uuid"]
+    assert svc.resolve(uuid)["match"] == "uuid"
+    assert svc.resolve(uuid.upper())["entity"]["uuid"] == uuid  # case-insensitive
+    by_value = svc.resolve("docker-hydra")
+    assert by_value["match"] == "identifier" and by_value["entity"]["uuid"] == uuid
+    by_scheme = svc.resolve("pve.vm:hydra/8003")  # scheme prefix, value keeps its own ':'-free form
+    assert by_scheme["match"] == "identifier" and by_scheme["entity"]["uuid"] == uuid
+    svc.update_entity(uuid, display_name="Hydra Docker Host")
+    by_name = svc.resolve("hydra docker host")
+    assert by_name["match"] == "display_name" and by_name["entity"]["uuid"] == uuid
+    assert svc.resolve("docker-hydra", entity_type="hypervisor")["entity"] is None
+
+
+def test_resolve_unknown_lists_candidates_and_never_creates(svc):
+    _host(svc, key="docker-hydra", vm="hydra/8003")
+    _host(svc, key="docker-atlas", vm="hydra/8004")
+    total_before = svc.get_stats()["total"]
+    res = svc.resolve("docker-")
+    assert res["entity"] is None and res["match"] is None
+    assert {c["display_name"] for c in res["candidates"]} == {"docker-hydra", "docker-atlas"}
+    assert svc.resolve("00000000-0000-0000-0000-000000000000") == {"entity": None, "match": None, "candidates": []}
+    assert svc.get_stats()["total"] == total_before  # resolve never creates
+    with pytest.raises(Exception):
+        svc.resolve("   ")
+
+
+def test_resolve_ambiguous_value_returns_candidates_not_a_guess(svc):
+    a = svc.identify("host", {"iac.host": "shared"}, display_name="A", source=SRC)["uuid"]
+    b = svc.identify("container", {"docker.container": "shared"}, display_name="B", source=SRC)["uuid"]
+    res = svc.resolve("shared")
+    assert res["entity"] is None and res["match"] == "ambiguous"
+    assert {c["uuid"] for c in res["candidates"]} == {a, b}
+
+
+def test_resolve_follows_merge_tombstone(svc):
+    keep = _host(svc, key="docker-hydra", vm="hydra/8003")["uuid"]
+    drop = svc.identify("host", {"fqdn": "docker-hydra.int.example"}, display_name="dup", source=SRC)["uuid"]
+    svc.merge(keep, drop)
+    assert svc.resolve(drop)["entity"]["uuid"] == keep
+    assert svc.resolve("docker-hydra.int.example")["entity"]["uuid"] == keep

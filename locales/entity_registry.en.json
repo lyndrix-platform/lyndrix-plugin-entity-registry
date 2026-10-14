@@ -53,7 +53,12 @@
     "dropUuid": "UUID of the entity to merge into this one",
     "merge": "Merge into this",
     "retire": "Retire",
-    "retireConfirm": "Confirm retire"
+    "retireConfirm": "Confirm retire",
+    "itsm": "Service management",
+    "itsmHint": "Records in the ITSM plugin that reference this configuration item.",
+    "itsmNone": "No open records for this configuration item.",
+    "itsmNewIncident": "New incident",
+    "itsmAll": "All records"
   },
   "conflicts": {
     "title": "Open conflicts",

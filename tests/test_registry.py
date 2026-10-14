@@ -4,7 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -28,6 +28,8 @@ def svc(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
+    # Enforce FKs like MariaDB does, so flush-order bugs fail here too.
+    event.listen(engine, "connect", lambda conn, _rec: conn.execute("PRAGMA foreign_keys=ON"))
     monkeypatch.setattr(
         database, "db_instance",
         SimpleNamespace(engine=engine, SessionLocal=sessionmaker(bind=engine), is_connected=True),

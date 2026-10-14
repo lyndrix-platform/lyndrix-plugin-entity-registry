@@ -342,6 +342,7 @@ class EntityRegistryService:
             last_seen_at=_now(),
         )
         s.add(entity)
+        s.flush()  # parent row first — Identifier FKs reference it
         for scheme, value in idents.items():
             s.add(Identifier(entity_uuid=entity.uuid, scheme=scheme, value=value, source=source))
         try:
@@ -467,6 +468,7 @@ class EntityRegistryService:
                     attributes=dict(attributes or {}), last_seen_at=_now(),
                 )
                 s.add(entity)
+                s.flush()  # parent row first — Identifier FKs reference it
                 for scheme, value in idents.items():
                     s.add(Identifier(entity_uuid=uuid, scheme=scheme, value=value, source=source))
                 changes: list[str] = []

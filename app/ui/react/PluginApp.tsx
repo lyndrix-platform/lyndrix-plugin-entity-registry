@@ -169,11 +169,11 @@ function EntityList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (uui
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
-        <select className="lx-select" value={type} onChange={(e) => setType(e.target.value)}>
+        <select className="lx-select" style={{ flex: '0 0 170px', width: 'auto' }} value={type} onChange={(e) => setType(e.target.value)}>
           <option value="">{t('list.allTypes', { defaultValue: 'All types' })}</option>
           {catalog?.entity_types.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
         </select>
-        <select className="lx-select" value={status} onChange={(e) => setStatus(e.target.value)}>
+        <select className="lx-select" style={{ flex: '0 0 150px', width: 'auto' }} value={status} onChange={(e) => setStatus(e.target.value)}>
           <option value="active">{t('status.active', { defaultValue: 'active' })}</option>
           <option value="retired">{t('status.retired', { defaultValue: 'retired' })}</option>
           <option value="all">{t('list.allStatuses', { defaultValue: 'all' })}</option>
@@ -354,7 +354,7 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
               </div>
             ))}
             <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.5rem', flexWrap: 'wrap' }}>
-              <select className="lx-select" value={relKind} onChange={(e) => setRelKind(e.target.value)}>
+              <select className="lx-select" style={{ flex: '0 0 170px', width: 'auto' }} value={relKind} onChange={(e) => setRelKind(e.target.value)}>
                 <option value="">{t('detail.pickRelation', { defaultValue: 'relation…' })}</option>
                 {catalog?.relations.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
               </select>

@@ -115,6 +115,9 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>
 }
 
+// Path params are user-controlled strings (UUIDs typed into inputs); always
+// encode them so a stray '/' or '..' cannot change the request path.
+const enc = (v: string | number) => encodeURIComponent(String(v))
 const base = (sub: string) => `/api/plugins/${PLUGIN_ID}/${sub}`
 
 export const registryApi = {
@@ -127,25 +130,25 @@ export const registryApi = {
     if (p.offset) qs.set('offset', String(p.offset))
     return apiFetch<{ total: number; entities: Entity[] }>(base(`entities?${qs}`))
   },
-  getEntity: (uuid: string) => apiFetch<{ entity: Entity }>(base(`entities/${uuid}`)),
+  getEntity: (uuid: string) => apiFetch<{ entity: Entity }>(base(`entities/${enc(uuid)}`)),
   updateEntity: (uuid: string, body: { display_name?: string; attributes?: Record<string, unknown> }) =>
-    apiFetch<{ entity: Entity }>(base(`entities/${uuid}`), { method: 'PATCH', body: JSON.stringify(body) }),
-  retire: (uuid: string) => apiFetch<{ entity: Entity }>(base(`entities/${uuid}/retire`), { method: 'POST' }),
+    apiFetch<{ entity: Entity }>(base(`entities/${enc(uuid)}`), { method: 'PATCH', body: JSON.stringify(body) }),
+  retire: (uuid: string) => apiFetch<{ entity: Entity }>(base(`entities/${enc(uuid)}/retire`), { method: 'POST' }),
   merge: (keep: string, drop: string) =>
-    apiFetch<{ entity: Entity }>(base(`entities/${keep}/merge`), {
+    apiFetch<{ entity: Entity }>(base(`entities/${enc(keep)}/merge`), {
       method: 'POST', body: JSON.stringify({ drop_uuid: drop }),
     }),
   addRelation: (uuid: string, to_uuid: string, relation: string) =>
-    apiFetch<{ relation: RelationView }>(base(`entities/${uuid}/relations`), {
+    apiFetch<{ relation: RelationView }>(base(`entities/${enc(uuid)}/relations`), {
       method: 'POST', body: JSON.stringify({ to_uuid, relation }),
     }),
   removeRelation: (uuid: string, relation: string, to_uuid: string) =>
-    apiFetch<{ ok: boolean }>(base(`entities/${uuid}/relations/${relation}/${to_uuid}`), { method: 'DELETE' }),
+    apiFetch<{ ok: boolean }>(base(`entities/${enc(uuid)}/relations/${enc(relation)}/${enc(to_uuid)}`), { method: 'DELETE' }),
   lookup: (scheme: string, value: string) =>
     apiFetch<{ entity: Entity }>(base(`lookup?scheme=${encodeURIComponent(scheme)}&value=${encodeURIComponent(value)}`)),
   listConflicts: (status = 'open') => apiFetch<{ conflicts: Conflict[] }>(base(`conflicts?status=${status}`)),
   dismissConflict: (id: number, reason?: string) =>
-    apiFetch<{ conflict: Conflict }>(base(`conflicts/${id}/dismiss`), {
+    apiFetch<{ conflict: Conflict }>(base(`conflicts/${enc(id)}/dismiss`), {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
   getCatalog: () => apiFetch<Catalog>(base('catalog')),

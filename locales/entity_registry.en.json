@@ -1,0 +1,67 @@
+{
+  "title": "Entity Registry",
+  "subtitle": "One stable UUID per configuration item, shared by every plugin.",
+  "common": {
+    "back": "Back",
+    "cancel": "Cancel",
+    "refresh": "Refresh",
+    "remove": "Remove"
+  },
+  "status": {
+    "active": "active",
+    "retired": "retired",
+    "merged": "merged"
+  },
+  "stats": {
+    "total_one": "{{count}} entity",
+    "total_other": "{{count}} entities",
+    "identifiers_one": "{{count}} identifier",
+    "identifiers_other": "{{count}} identifiers",
+    "relations_one": "{{count}} relation",
+    "relations_other": "{{count}} relations",
+    "conflicts_one": "{{count}} open conflict",
+    "conflicts_other": "{{count}} open conflicts"
+  },
+  "list": {
+    "searchPlaceholder": "Search name or identifier…",
+    "allTypes": "All types",
+    "allStatuses": "all",
+    "empty": "No entities yet. Other plugins register them via identify().",
+    "colName": "Name",
+    "colType": "Type",
+    "colIdentifiers": "Identifiers",
+    "colSources": "Seen by",
+    "colLastSeen": "Last seen",
+    "shown": "{{shown}} of {{total}}"
+  },
+  "detail": {
+    "identity": "Identity",
+    "owner": "Owner",
+    "created": "Created",
+    "mergedInto": "Merged into",
+    "identifiers": "Identifiers",
+    "scheme": "Scheme",
+    "value": "Value",
+    "source": "Source",
+    "attributes": "Attributes",
+    "relations": "Relations",
+    "pickRelation": "relation…",
+    "targetUuid": "target entity UUID",
+    "addRelation": "Link",
+    "actions": "Actions",
+    "mergeHint": "Merge another entity into this one: its identifiers and relations move here and its UUID keeps resolving to this entity.",
+    "dropUuid": "UUID of the entity to merge into this one",
+    "merge": "Merge into this",
+    "retire": "Retire",
+    "retireConfirm": "Confirm retire"
+  },
+  "conflicts": {
+    "title": "Open conflicts",
+    "hint": "One observation matched several entities. The registry never merges automatically — pick the entity to keep, or dismiss if they really are different things.",
+    "none": "No open conflicts.",
+    "reportedBy": "reported by {{source}} · {{when}}",
+    "dismiss": "Dismiss",
+    "matched": "matched via",
+    "keep": "Keep this, merge others"
+  }
+}

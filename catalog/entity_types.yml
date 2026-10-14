@@ -1,0 +1,104 @@
+# Entity Registry catalog — the vocabulary of the registry.
+#
+# entity_types:       what kind of things get a UUID (CI classes)
+# identifier_schemes: namespaced keys that identify an entity. Every
+#                     (scheme, value) pair has exactly ONE owner — the DB
+#                     enforces it. When one identify() call matches several
+#                     entities, the scheme with the LOWEST priority number
+#                     decides which one is returned (and a conflict is filed).
+#                     Weak, reusable facts such as IP addresses are NOT schemes;
+#                     they live in entity attributes so an address reuse can
+#                     never merge two machines.
+# relations:          allowed edge labels between entities.
+
+entity_types:
+  - id: host
+    label: Host
+    icon: dns
+    description: Virtual machine or LXC container managed as a server.
+  - id: hypervisor
+    label: Hypervisor
+    icon: developer_board
+    description: Physical node running VMs/containers (e.g. a Proxmox node).
+  - id: service
+    label: Service
+    icon: widgets
+    description: Deployed application/service instance.
+  - id: container
+    label: Container
+    icon: view_in_ar
+    description: Runtime container (Docker) belonging to a host.
+  - id: network
+    label: Network
+    icon: lan
+    description: Network segment, VLAN or subnet.
+  - id: itsm_record
+    label: ITSM Record
+    icon: assignment
+    description: Incident, change, problem or request managed by the ITSM plugin.
+  - id: generic
+    label: Generic
+    icon: category
+    description: Anything that does not fit another type.
+
+identifier_schemes:
+  - id: pve.vm
+    label: Proxmox VM/CT
+    description: "<node>/<vmid> — the strongest machine identity we have."
+    priority: 10
+  - id: itsm.number
+    label: ITSM record number
+    priority: 10
+  - id: bmc.reconid
+    label: BMC Helix Reconciliation ID
+    priority: 10
+  - id: iac.host
+    label: IaC inventory host key
+    description: The YAML key under hosts in the IaC controller SSoT.
+    priority: 20
+  - id: fqdn
+    label: FQDN
+    priority: 30
+  - id: docker.container
+    label: Docker container
+    description: "<host>/<container-name>"
+    priority: 40
+  - id: server_manager.id
+    label: Server Manager record id
+    priority: 50
+  - id: monitoring.monitor
+    label: Monitoring monitor id
+    priority: 60
+  - id: external
+    label: External reference
+    description: "Free-form <system>:<id> for systems without their own scheme."
+    priority: 90
+
+relations:
+  - id: runs_on
+    label: runs on
+    inverse: hosts
+  - id: hosts
+    label: hosts
+    inverse: runs_on
+  - id: depends_on
+    label: depends on
+    inverse: required_by
+  - id: required_by
+    label: required by
+    inverse: depends_on
+  - id: member_of
+    label: member of
+    inverse: has_member
+  - id: has_member
+    label: has member
+    inverse: member_of
+  - id: affects
+    label: affects
+    inverse: affected_by
+  - id: affected_by
+    label: affected by
+    inverse: affects
+  - id: related_to
+    label: related to
+    inverse: related_to

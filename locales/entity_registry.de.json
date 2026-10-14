@@ -1,0 +1,67 @@
+{
+  "title": "Entity Registry",
+  "subtitle": "Eine stabile UUID pro Configuration Item, von allen Plugins geteilt.",
+  "common": {
+    "back": "Zurück",
+    "cancel": "Abbrechen",
+    "refresh": "Aktualisieren",
+    "remove": "Entfernen"
+  },
+  "status": {
+    "active": "aktiv",
+    "retired": "stillgelegt",
+    "merged": "zusammengeführt"
+  },
+  "stats": {
+    "total_one": "{{count}} Entität",
+    "total_other": "{{count}} Entitäten",
+    "identifiers_one": "{{count}} Identifier",
+    "identifiers_other": "{{count}} Identifier",
+    "relations_one": "{{count}} Beziehung",
+    "relations_other": "{{count}} Beziehungen",
+    "conflicts_one": "{{count}} offener Konflikt",
+    "conflicts_other": "{{count}} offene Konflikte"
+  },
+  "list": {
+    "searchPlaceholder": "Name oder Identifier suchen…",
+    "allTypes": "Alle Typen",
+    "allStatuses": "alle",
+    "empty": "Noch keine Entitäten. Andere Plugins registrieren sie über identify().",
+    "colName": "Name",
+    "colType": "Typ",
+    "colIdentifiers": "Identifier",
+    "colSources": "Gesehen von",
+    "colLastSeen": "Zuletzt gesehen",
+    "shown": "{{shown}} von {{total}}"
+  },
+  "detail": {
+    "identity": "Identität",
+    "owner": "Eigentümer",
+    "created": "Angelegt",
+    "mergedInto": "Zusammengeführt in",
+    "identifiers": "Identifier",
+    "scheme": "Schema",
+    "value": "Wert",
+    "source": "Quelle",
+    "attributes": "Attribute",
+    "relations": "Beziehungen",
+    "pickRelation": "Beziehung…",
+    "targetUuid": "UUID der Ziel-Entität",
+    "addRelation": "Verknüpfen",
+    "actions": "Aktionen",
+    "mergeHint": "Eine andere Entität in diese zusammenführen: ihre Identifier und Beziehungen wandern hierher, ihre UUID zeigt weiterhin auf diese Entität.",
+    "dropUuid": "UUID der Entität, die in diese zusammengeführt wird",
+    "merge": "In diese zusammenführen",
+    "retire": "Stilllegen",
+    "retireConfirm": "Stilllegen bestätigen"
+  },
+  "conflicts": {
+    "title": "Offene Konflikte",
+    "hint": "Eine Beobachtung passte auf mehrere Entitäten. Die Registry führt nie automatisch zusammen — wähle die Entität, die bleibt, oder verwerfe den Konflikt, wenn es wirklich verschiedene Dinge sind.",
+    "none": "Keine offenen Konflikte.",
+    "reportedBy": "gemeldet von {{source}} · {{when}}",
+    "dismiss": "Verwerfen",
+    "matched": "erkannt über",
+    "keep": "Diese behalten, andere zusammenführen"
+  }
+}

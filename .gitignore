@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.cache/
+.pytest_cache/
+
+# Plugin React UI build toolchain
+node_modules/
+
+# Installed at plugin install time
+vendor/

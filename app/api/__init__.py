@@ -264,7 +264,7 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
     @router.post("/catalog/reload")
     async def reload_catalog(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
         def _run() -> dict:
-            service.reload_catalog()
+            service.reload_catalog(announce=True)  # peers reload on the cluster event
             return service.catalog.catalog.to_payload()
 
         try:

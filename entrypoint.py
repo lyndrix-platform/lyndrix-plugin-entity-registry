@@ -33,6 +33,8 @@ Events consumed
   entity_registry:relate     — {from_uuid, to_uuid, relation, source?}
   entity_registry:unrelate   — {from_uuid, to_uuid, relation}
   entity_registry:retire     — {uuid, source?}
+  entity_registry:catalog_reloaded — cluster-wide (see below); a peer's reload
+                               (payload["_origin"] set) re-reads the catalog here.
 
 Events emitted
 --------------
@@ -44,6 +46,15 @@ Events emitted
   entity_registry:entity_retired — {entity}
   entity_registry:conflict       — {conflict}
   entity_registry:ingest_failed  — {topic, error, payload_keys}
+  entity_registry:catalog_reloaded — {reloaded_at}, cluster=True, after an
+                                   operator-triggered POST /catalog/reload
+
+Cluster
+-------
+Routes and bus handlers run on every instance; all state lives in the shared
+DB. Bootstrap DDL is serialized with the core bootstrap lock, writes run READ
+COMMITTED with a 1020/1205/1213 retry, and unique-key races (identifier,
+open conflict) are resolved by re-reading the winner's row.
 """
 import asyncio
 import time
@@ -51,7 +62,7 @@ import time
 from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api import IdentifyPayload, RegisterPayload, build_plugin_router
-from .app.logic.service import NotFound, RegistryError
+from .app.logic.service import CATALOG_RELOADED_TOPIC, NotFound, RegistryError
 from .app.logic.service import entity_registry_service as svc
 
 PLUGIN_ID = "lyndrix.plugin.entity_registry"
@@ -61,7 +72,7 @@ PLUGIN_ID = "lyndrix.plugin.entity_registry"
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="Entity Registry",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Stable UUIDs for every configuration item. Reconciles identities across "
         "plugins (IaC, Server Manager, Monitoring, ITSM) so a renamed host keeps its id."
@@ -88,6 +99,7 @@ manifest = ModuleManifest(
             "entity_registry:relate",
             "entity_registry:unrelate",
             "entity_registry:retire",
+            CATALOG_RELOADED_TOPIC,
         ],
         "emit": [
             "entity_registry:identified",
@@ -98,6 +110,7 @@ manifest = ModuleManifest(
             "entity_registry:entity_retired",
             "entity_registry:conflict",
             "entity_registry:ingest_failed",
+            CATALOG_RELOADED_TOPIC,
         ],
     },
     roles=[
@@ -122,7 +135,7 @@ async def health(ctx) -> PluginHealthStatus:
     if not svc.is_ready:
         return PluginHealthStatus(status="error", details={"reason": "tables_not_initialized"})
     try:
-        stats = await asyncio.to_thread(svc.get_stats)
+        stats = await asyncio.to_thread(svc.health_probe)
     except Exception as exc:
         return PluginHealthStatus(
             status="error", details={"reason": "db_query_failed", "error": str(exc)},
@@ -145,21 +158,25 @@ def setup(ctx):
     svc.catalog.load()  # fail loudly on a broken catalog
     ctx.register_routes(build_plugin_router(svc))
 
-    def _db_init(reason: str) -> None:
-        try:
-            svc.on_db_connected()
-            ctx.log.info(f"Entity Registry: tables ready ({reason})")
-        except Exception as exc:
-            ctx.log.error(f"Entity Registry: DB init failed — {exc}")
-
     # db:connected fires before plugin activation; bootstrap now if possible and
-    # keep listening for reconnects.
+    # keep listening for reconnects. DDL runs off-loop under the bootstrap lock.
     if db_instance.is_connected:
-        _db_init("DB already connected")
+        ctx.create_task(svc.init_db("DB already connected"), name="entity_registry:db_init")
 
     @ctx.subscribe("db:connected")
     async def _on_db_connected(payload):
-        _db_init("db:connected")
+        await svc.init_db("db:connected")
+
+    @ctx.subscribe(CATALOG_RELOADED_TOPIC)
+    async def _on_catalog_reloaded(payload):
+        # Our own announcement has no _origin — that reload already happened.
+        if not isinstance(payload, dict) or not payload.get("_origin"):
+            return
+        try:
+            await asyncio.to_thread(svc.reload_catalog)
+            ctx.log.info(f"Entity Registry: catalog reloaded (peer {payload['_origin']})")
+        except Exception as exc:
+            ctx.log.error(f"Entity Registry: catalog reload from peer failed — {exc}")
 
     # ── Inbound bus API ──────────────────────────────────────────────────────
     def _fail(topic: str, payload, error: str) -> None:

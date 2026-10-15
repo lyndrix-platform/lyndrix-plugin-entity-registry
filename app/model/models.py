@@ -16,6 +16,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -120,12 +121,20 @@ class Relation(_Base):
 
 class Conflict(_Base):
     __tablename__ = "registry_conflicts"
+    __table_args__ = (
+        # One open conflict per fingerprint, enforced by the DB so two
+        # instances filing the same conflict at once cannot both win.
+        Index("uq_registry_conflict_open", "open_fingerprint", unique=True),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     entity_type = Column(String(64), nullable=False)
     # Stable key over (entity_type, sorted candidate uuids) so the same
     # unresolved conflict is filed once, not on every sync run.
     fingerprint = Column(String(64), nullable=False, index=True)
+    # = fingerprint while status == "open", NULL once resolved/dismissed
+    # (NULLs never collide in a unique index).
+    open_fingerprint = Column(String(64), nullable=True)
     # [{uuid, display_name, matched: [scheme, ...]}, ...]
     candidates = Column(JSON, nullable=False, default=list)
     # The identifiers of the identify() call that exposed the conflict.

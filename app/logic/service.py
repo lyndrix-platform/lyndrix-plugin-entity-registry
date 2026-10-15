@@ -17,24 +17,30 @@ entity_registry:conflict        — {conflict}
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, tuple_
+from sqlalchemy import func, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
 
-from ..model.database import ensure_tables, get_session
+from ..model.database import ensure_tables, get_session, retry_write
 from ..model.models import Conflict, Entity, Identifier, Relation
 from .catalog import CatalogLoader
 
 log = get_logger("Plugin:EntityRegistry:Service")
 
 LIVE_STATUSES = ("active", "retired")
+# identify() refreshes last_seen_at at most this often for an otherwise
+# unchanged entity — every sync run of every source would otherwise write the
+# same hot rows from N instances (and collide on MariaDB snapshot isolation).
+LAST_SEEN_RESOLUTION = timedelta(seconds=30)
+CATALOG_RELOADED_TOPIC = "entity_registry:catalog_reloaded"
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
@@ -79,9 +85,24 @@ class EntityRegistryService:
             self._loop = None
 
     def on_db_connected(self) -> None:
+        """Bootstrap tables (bootstrap-locked, peer-race tolerant), then go ready."""
         ensure_tables()
         self._ready = True
         log.info("EntityRegistry: DB tables ready")
+
+    async def init_db(self, reason: str, *, attempts: int = 5, pause: float = 5.0) -> bool:
+        """Run :meth:`on_db_connected` off-loop; retry a failed bootstrap a few
+        times instead of staying not-ready until the next restart."""
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.to_thread(self.on_db_connected)
+                log.info(f"EntityRegistry: tables ready ({reason})")
+                return True
+            except Exception as exc:
+                log.error(f"EntityRegistry: DB init failed ({reason}, attempt {attempt}/{attempts}) — {exc}")
+                if attempt < attempts:
+                    await asyncio.sleep(pause * attempt)
+        return False
 
     @property
     def is_ready(self) -> bool:
@@ -94,8 +115,12 @@ class EntityRegistryService:
     def set_catalog_dir(self, path: str | Path) -> None:
         self.catalog.catalog_dir = Path(path)
 
-    def reload_catalog(self) -> None:
+    def reload_catalog(self, *, announce: bool = False) -> None:
+        """Re-read the catalog YAML. ``announce=True`` (operator-triggered reload)
+        tells the other cluster instances to reload theirs as well."""
         self.catalog.reload()
+        if announce:
+            self._emit(CATALOG_RELOADED_TOPIC, {"reloaded_at": _now().isoformat()}, cluster=True)
 
     # ── Validation ───────────────────────────────────────────────────────────
 
@@ -317,7 +342,37 @@ class EntityRegistryService:
             "open_conflicts": open_conflicts,
         }
 
+    def health_probe(self) -> dict:
+        """Cheap probe for ``health()`` (polled by every dashboard): one round
+        trip plus the open-conflict count."""
+        self._require_ready()
+        with get_session() as s:
+            s.execute(text("SELECT 1"))
+            open_conflicts = s.execute(
+                select(func.count()).select_from(Conflict).where(Conflict.status == "open")
+            ).scalar_one()
+        return {"open_conflicts": open_conflicts}
+
     # ── Reconciliation ───────────────────────────────────────────────────────
+
+    def _write(self, tx, *, what: str):
+        """Run a write transaction with the cluster retry policy.
+
+        ``tx()`` must be one complete transaction (own session). It is re-run on
+        MariaDB 1020/1205/1213 (``retry_write``) and once more after an
+        IntegrityError — a concurrent writer on another instance inserted the
+        same unique key first, so the re-run sees its row and continues from it.
+        """
+        try:
+            return retry_write(tx)
+        except IntegrityError:
+            log.info(f"EntityRegistry: {what} lost a concurrent insert race — re-reading")
+        try:
+            return retry_write(tx)
+        except IntegrityError as exc:
+            raise RegistryError(
+                f"Concurrent registration for the same identifier — retry ({what})"
+            ) from exc
 
     def identify(
         self,
@@ -343,6 +398,16 @@ class EntityRegistryService:
         self._check_schemes(idents)
         source = (source or "").strip() or None
 
+        result, events = self._write(
+            lambda: self._identify_tx(entity_type, idents, display_name, attributes, source),
+            what="identify",
+        )
+        for topic, payload in events:
+            self._emit(topic, payload)
+        return result
+
+    def _identify_tx(self, entity_type, idents, display_name, attributes, source):
+        """One identify() transaction → ``(result, events to emit after commit)``."""
         with get_session() as s:
             matches = s.execute(
                 select(Identifier).where(
@@ -365,8 +430,7 @@ class EntityRegistryService:
                 )
                 result = {"uuid": entity.uuid, "created": True, "conflict": False,
                           "entity": self._entity_detail(s, entity)}
-                self._emit("entity_registry:entity_created", {"entity": result["entity"]})
-                return result
+                return result, [("entity_registry:entity_created", {"entity": result["entity"]})]
 
             if len(matched) == 1:
                 entity_uuid, schemes = next(iter(matched.items()))
@@ -384,11 +448,10 @@ class EntityRegistryService:
                 s.commit()
                 s.refresh(entity)
                 detail = self._entity_detail(s, entity)
-                if changes:
-                    self._emit("entity_registry:entity_updated",
-                               {"entity": detail, "changes": changes})
+                events = [("entity_registry:entity_updated",
+                           {"entity": detail, "changes": changes})] if changes else []
                 return {"uuid": entity.uuid, "created": False, "conflict": False,
-                        "entity": detail}
+                        "entity": detail}, events
 
             # Several entities claim these identifiers → conflict.
             winner_uuid = min(
@@ -398,10 +461,9 @@ class EntityRegistryService:
             conflict = self._file_conflict(s, entity_type, matched, idents, source)
             winner = s.get(Entity, winner_uuid)
             detail = self._entity_detail(s, winner)
-            if conflict is not None:
-                self._emit("entity_registry:conflict", {"conflict": conflict})
+            events = [("entity_registry:conflict", {"conflict": conflict})] if conflict else []
             return {"uuid": winner_uuid, "created": False, "conflict": True,
-                    "entity": detail}
+                    "entity": detail}, events
 
     def _create(self, s, entity_type, idents, *, display_name, attributes, source) -> Entity:
         entity = Entity(
@@ -418,12 +480,10 @@ class EntityRegistryService:
         s.flush()  # parent row first — Identifier FKs reference it
         for scheme, value in idents.items():
             s.add(Identifier(entity_uuid=entity.uuid, scheme=scheme, value=value, source=source))
-        try:
-            s.commit()
-        except IntegrityError:
-            # Lost a race with a concurrent identify() for the same key.
-            s.rollback()
-            raise RegistryError("Concurrent registration for the same identifier — retry")
+        # An IntegrityError here means a concurrent identify() (possibly on
+        # another instance) created the same key first; identify() re-runs the
+        # lookup and absorbs into the winner (see _write).
+        s.commit()
         s.refresh(entity)
         log.info(f"EntityRegistry: created {entity_type} '{entity.display_name}' ({entity.uuid})")
         return entity
@@ -456,7 +516,9 @@ class EntityRegistryService:
             # Seen again by a source → it is back.
             entity.status = "active"
             changes.append("status")
-        entity.last_seen_at = _now()
+        now = _now()
+        if changes or entity.last_seen_at is None or now - entity.last_seen_at >= LAST_SEEN_RESOLUTION:
+            entity.last_seen_at = now
         return changes
 
     def _file_conflict(self, s, entity_type, matched, idents, source) -> dict | None:
@@ -484,9 +546,15 @@ class EntityRegistryService:
             identifiers=idents,
             source=source,
             status="open",
+            open_fingerprint=fingerprint,
         )
         s.add(conflict)
-        s.commit()
+        try:
+            s.commit()
+        except IntegrityError:
+            # Another instance filed the same open conflict a moment ago.
+            s.rollback()
+            return None
         s.refresh(conflict)
         log.warning(
             f"EntityRegistry: conflict — {len(candidate_uuids)} {entity_type} entities match "
@@ -518,6 +586,18 @@ class EntityRegistryService:
         self._check_schemes(idents)
         source = (source or "").strip() or None
 
+        detail, created, changes = self._write(
+            lambda: self._register_tx(uuid, entity_type, display_name, idents, attributes, source),
+            what="register",
+        )
+        if created:
+            log.info(f"EntityRegistry: registered {entity_type} '{detail['display_name']}' ({uuid})")
+            self._emit("entity_registry:entity_created", {"entity": detail})
+        elif changes:
+            self._emit("entity_registry:entity_updated", {"entity": detail, "changes": changes})
+        return detail, created
+
+    def _register_tx(self, uuid, entity_type, display_name, idents, attributes, source):
         with get_session() as s:
             if idents:
                 owned = s.execute(
@@ -554,14 +634,7 @@ class EntityRegistryService:
                 )
             s.commit()
             s.refresh(entity)
-            detail = self._entity_detail(s, entity)
-
-        if created:
-            log.info(f"EntityRegistry: registered {entity_type} '{detail['display_name']}' ({uuid})")
-            self._emit("entity_registry:entity_created", {"entity": detail})
-        elif changes:
-            self._emit("entity_registry:entity_updated", {"entity": detail, "changes": changes})
-        return detail, created
+            return self._entity_detail(s, entity), created, changes
 
     def update_entity(
         self,
@@ -572,6 +645,18 @@ class EntityRegistryService:
         replace_attributes: bool = False,
     ) -> dict | None:
         self._require_ready()
+        res = self._write(
+            lambda: self._update_tx(uuid, display_name, attributes, replace_attributes),
+            what="update_entity",
+        )
+        if res is None:
+            return None
+        detail, changes = res
+        if changes:
+            self._emit("entity_registry:entity_updated", {"entity": detail, "changes": changes})
+        return detail
+
+    def _update_tx(self, uuid, display_name, attributes, replace_attributes):
         with get_session() as s:
             entity = s.get(Entity, uuid)
             if entity is None or entity.status == "merged":
@@ -587,10 +672,7 @@ class EntityRegistryService:
                     changes.append("attributes")
             s.commit()
             s.refresh(entity)
-            detail = self._entity_detail(s, entity)
-        if changes:
-            self._emit("entity_registry:entity_updated", {"entity": detail, "changes": changes})
-        return detail
+            return self._entity_detail(s, entity), changes
 
     def retire(self, uuid: str, *, source: str | None = None) -> dict | None:
         self._require_ready()
@@ -613,6 +695,12 @@ class EntityRegistryService:
         self._require_ready()
         if keep_uuid == drop_uuid:
             raise RegistryError("keep and drop must differ")
+        detail = self._write(lambda: self._merge_tx(keep_uuid, drop_uuid), what="merge")
+        log.info(f"EntityRegistry: merged {drop_uuid} into {keep_uuid} by {source}")
+        self._emit("entity_registry:entity_merged", {"keep": detail, "drop_uuid": drop_uuid})
+        return detail
+
+    def _merge_tx(self, keep_uuid: str, drop_uuid: str) -> dict:
         with get_session() as s:
             keep, drop = s.get(Entity, keep_uuid), s.get(Entity, drop_uuid)
             if keep is None or drop is None:
@@ -660,16 +748,13 @@ class EntityRegistryService:
             for c in s.execute(select(Conflict).where(Conflict.status == "open")).scalars().all():
                 if any(cand.get("uuid") == drop_uuid for cand in (c.candidates or [])):
                     c.status = "resolved"
+                    c.open_fingerprint = None
                     c.resolution = f"merged {drop_uuid} into {keep_uuid}"
                     c.resolved_at = _now()
 
             s.commit()
             s.refresh(keep)
-            detail = self._entity_detail(s, keep)
-
-        log.info(f"EntityRegistry: merged {drop_uuid} into {keep_uuid} by {source}")
-        self._emit("entity_registry:entity_merged", {"keep": detail, "drop_uuid": drop_uuid})
-        return detail
+            return self._entity_detail(s, keep)
 
     # ── Relations ────────────────────────────────────────────────────────────
 
@@ -732,6 +817,7 @@ class EntityRegistryService:
                 return None
             if c.status == "open":
                 c.status = "dismissed"
+                c.open_fingerprint = None
                 c.resolution = (reason or "dismissed")[:2000]
                 c.resolved_at = _now()
                 s.commit()
@@ -740,9 +826,14 @@ class EntityRegistryService:
 
     # ── Private ──────────────────────────────────────────────────────────────
 
-    def _emit(self, topic: str, payload: dict) -> None:
+    def _emit(self, topic: str, payload: dict, *, cluster: bool = False) -> None:
+        """Emit on the bus; ``cluster=True`` also reaches the other core instances."""
         if not self._ctx:
             return
+        if cluster:
+            emit = functools.partial(self._emit_cluster, topic, payload)
+        else:
+            emit = functools.partial(self._ctx.emit, topic, payload)
         # Service methods run in to_thread workers; async bus subscribers need
         # the loop thread, so marshal emits back onto it.
         try:
@@ -751,9 +842,15 @@ class EntityRegistryService:
             running = None
         loop = self._loop
         if running is None and loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(self._ctx.emit, topic, payload)
+            loop.call_soon_threadsafe(emit)
             return
-        self._ctx.emit(topic, payload)
+        emit()
+
+    def _emit_cluster(self, topic: str, payload: dict) -> None:
+        try:
+            self._ctx.emit(topic, payload, cluster=True)
+        except TypeError:  # core without cluster bus (API < 1.7): local only
+            self._ctx.emit(topic, payload)
 
 
 entity_registry_service = EntityRegistryService()

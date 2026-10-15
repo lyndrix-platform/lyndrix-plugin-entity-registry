@@ -122,7 +122,27 @@ UUID weiter und holt sie beim nächsten Sync nach.
 
 `entity_registry:identified` und `entity_registry:lookup_result` (Antworten), `entity_created`,
 `entity_updated` (`{entity, changes}`), `entity_merged` (`{keep, drop_uuid}`), `entity_retired`,
-`conflict`, `ingest_failed` (`{topic, error, payload_keys}` — Fehler bei Pushes ohne `request_id`).
+`conflict`, `ingest_failed` (`{topic, error, payload_keys}` — Fehler bei Pushes ohne `request_id`),
+`entity_registry:catalog_reloaded` (`{reloaded_at}`, clusterweit nach `POST /catalog/reload`).
+
+## Cluster-Betrieb (ab 0.2.0)
+
+Läuft der Core mit mehreren Instanzen (`LYNDRIX_CLUSTER_MODE=cluster`), arbeitet die Registry auf
+jeder Instanz; der gesamte Zustand liegt in der gemeinsamen MariaDB.
+
+- **Bootstrap:** Tabellen und Migrationen laufen unter `db_instance.advisory_lock("lyndrix_bootstrap")`
+  im Thread-Pool. Ein verlorenes Rennen („Tabelle/Spalte/Index existiert bereits“, 1050/1060/1061)
+  gilt als Erfolg; schlägt der Bootstrap fehl, wird er bis zu fünfmal wiederholt.
+- **Schreibzugriffe** laufen mit READ COMMITTED und werden bei MariaDB-Fehler 1020/1205/1213
+  (Snapshot-Isolation, Lock-Timeout, Deadlock) kurz wiederholt. `last_seen_at` wird bei sonst
+  unverändertem Objekt höchstens alle 30 s geschrieben.
+- **Wettläufe um eindeutige Schlüssel:** Legt eine andere Instanz denselben Identifier gleichzeitig
+  an, liest `identify()` neu und übernimmt die Beobachtung in die Gewinner-Entität. Offene Konflikte
+  tragen den eindeutigen Schlüssel `open_fingerprint` (NULL nach Auflösung) und werden so nur einmal
+  abgelegt.
+- **Katalog:** `POST /catalog/reload` lädt lokal neu und sendet `entity_registry:catalog_reloaded`
+  mit `cluster=True`; die anderen Instanzen laden daraufhin ebenfalls neu.
+- **`health()`** prüft nur `SELECT 1` und zählt offene Konflikte.
 
 ## Rollen
 

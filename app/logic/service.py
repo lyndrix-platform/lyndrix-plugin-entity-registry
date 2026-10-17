@@ -13,6 +13,8 @@ entity_registry:entity_updated  — {entity, changes: [...]}
 entity_registry:entity_merged   — {keep: entity, drop_uuid}
 entity_registry:entity_retired  — {entity}
 entity_registry:conflict        — {conflict}
+entity_registry:maintenance_changed — {source, kind, count, ...} once per
+                                  processed maintenance:* event (0.3.0)
 """
 from __future__ import annotations
 
@@ -24,13 +26,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, text, tuple_
+from sqlalchemy import delete, func, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
 
 from ..model.database import ensure_tables, get_session, retry_write
-from ..model.models import Conflict, Entity, Identifier, Relation
+from ..model.models import Conflict, Entity, Identifier, MaintenanceEntry, Relation
+from . import maintenance as mwx
 from .catalog import CatalogLoader
 
 log = get_logger("Plugin:EntityRegistry:Service")
@@ -41,6 +44,10 @@ LIVE_STATUSES = ("active", "retired")
 # same hot rows from N instances (and collide on MariaDB snapshot isolation).
 LAST_SEEN_RESOLUTION = timedelta(seconds=30)
 CATALOG_RELOADED_TOPIC = "entity_registry:catalog_reloaded"
+MAINTENANCE_CHANGED_TOPIC = "entity_registry:maintenance_changed"
+# Expired overrides are purged this long after their effective end (no timer:
+# the sweep piggybacks on the next override event).
+PURGE_GRACE = timedelta(days=1)
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
@@ -187,6 +194,7 @@ class EntityRegistryService:
                 "other_display_name": name,
                 "other_entity_type": etype,
             })
+        data["maintenance"] = self.maintenance_for(s, [entity.uuid])[entity.uuid]
         return data
 
     def get_entity(self, uuid: str, *, follow_merge: bool = True) -> dict | None:
@@ -203,7 +211,14 @@ class EntityRegistryService:
         status: str | None = "active",
         limit: int = 200,
         offset: int = 0,
+        in_maintenance: bool | None = None,
     ) -> dict:
+        """List entities with identifiers and a compact ``maintenance`` state.
+
+        ``in_maintenance=True`` narrows the SQL to entities that have maintenance
+        rows at all, evaluates the page and keeps only the active ones — so
+        ``total`` then counts the matches of this page, not the whole table.
+        """
         self._require_ready()
         with get_session() as s:
             stmt = select(Entity)
@@ -219,21 +234,17 @@ class EntityRegistryService:
                 stmt = stmt.where(
                     or_(Entity.display_name.like(like), Entity.uuid.in_(matched))
                 )
+            if in_maintenance:
+                stmt = stmt.where(Entity.uuid.in_(select(MaintenanceEntry.entity_uuid)))
             total = s.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
             rows = s.execute(
                 stmt.order_by(Entity.entity_type, Entity.display_name).limit(limit).offset(offset)
             ).scalars().all()
-            uuids = [r.uuid for r in rows]
-            idents: dict[str, list[dict]] = {u: [] for u in uuids}
-            if uuids:
-                for i in s.execute(
-                    select(Identifier).where(Identifier.entity_uuid.in_(uuids))
-                ).scalars():
-                    idents[i.entity_uuid].append(i.to_dict())
-            return {
-                "total": total,
-                "entities": [{**r.to_dict(), "identifiers": idents[r.uuid]} for r in rows],
-            }
+            entities = self._summaries(s, rows)
+            if in_maintenance:
+                entities = [e for e in entities if e["maintenance"]["active"]]
+                total = len(entities)
+            return {"total": total, "entities": entities}
 
     def lookup(self, scheme: str, value: str) -> dict | None:
         self._require_ready()
@@ -312,12 +323,17 @@ class EntityRegistryService:
             return {"entity": None, "match": None, "candidates": near}
 
     def _summaries(self, s, entities: list[Entity]) -> list[dict]:
+        """List rows: ``to_dict()`` + identifiers + compact maintenance (two IN queries)."""
         uuids = [e.uuid for e in entities]
         idents: dict[str, list[dict]] = {u: [] for u in uuids}
         if uuids:
             for i in s.execute(select(Identifier).where(Identifier.entity_uuid.in_(uuids))).scalars():
                 idents[i.entity_uuid].append(i.to_dict())
-        return [{**e.to_dict(), "identifiers": idents[e.uuid]} for e in entities]
+        states = self.maintenance_for(s, uuids)
+        return [
+            {**e.to_dict(), "identifiers": idents[e.uuid], "maintenance": mwx.compact(states[e.uuid])}
+            for e in entities
+        ]
 
     def get_stats(self) -> dict:
         self._require_ready()
@@ -798,6 +814,296 @@ class EntityRegistryService:
             s.delete(rel)
             s.commit()
         return True
+
+    def host_of(self, uuid: str) -> dict | None:
+        """The host a service/container runs on: the target of its outgoing
+        ``runs_on`` relation (merge tombstones followed on both ends).
+        ``None`` when no such relation exists; ``NotFound`` for an unknown uuid."""
+        self._require_ready()
+        with get_session() as s:
+            entity = self._resolve_live(s, uuid)
+            if entity is None:
+                raise NotFound("Unknown entity uuid")
+            rels = s.execute(
+                select(Relation)
+                .where(Relation.from_uuid == entity.uuid, Relation.relation == "runs_on")
+                .order_by(Relation.id)
+            ).scalars().all()
+            for rel in rels:
+                host = self._resolve_live(s, rel.to_uuid)
+                if host is not None and host.status != "merged":
+                    return {"host": self._entity_detail(s, host), "relation": rel.to_dict()}
+            return None
+
+    # ── Maintenance read-model (0.3.0) ───────────────────────────────────────
+    # Fed by maintenance:windows_published / override_started / override_ended.
+    # State lives in registry_maintenance; current/next window and override
+    # expiry are evaluated when read (app/logic/maintenance.py), never stored.
+
+    def apply_windows(self, source: str, items: list, *, replaces: bool = True) -> dict:
+        """Store the window set one emitter published (``windows_published``).
+
+        ``replaces=True`` drops every earlier window row of ``source`` in the
+        same transaction, so a duplicate delivery (or one on another instance)
+        ends in the same state. ``ci_id``s follow merge tombstones; unknown ones
+        are skipped and counted — the registry never creates entities here. The
+        item's ``kind`` is informational only (the entity's type is
+        authoritative). One ``entity_registry:maintenance_changed`` is emitted
+        per call instead of an ``entity_updated`` per entity.
+        """
+        self._require_ready()
+        source = (source or "").strip()
+        if not source or len(source) > mwx.MAX_SOURCE_LEN:
+            raise RegistryError("source is required (1-64 chars)")
+        if not isinstance(items, list):
+            raise RegistryError("items must be a list")
+        normalized: list[dict] = []
+        invalid = 0
+        for item in items:
+            norm = mwx.normalize_item(item)
+            if norm is None:
+                invalid += 1
+            else:
+                normalized.append(norm)
+        stored, unknown = self._write(
+            lambda: self._apply_windows_tx(source, normalized, replaces), what="apply_windows"
+        )
+        if unknown or invalid:
+            log.info(
+                f"EntityRegistry: maintenance windows from '{source}' — {stored} stored, "
+                f"{unknown} unknown ci_id(s) skipped, {invalid} invalid item(s) skipped"
+            )
+        self._emit(MAINTENANCE_CHANGED_TOPIC, {
+            "source": source, "kind": "window", "count": stored,
+            "skipped_unknown": unknown, "skipped_invalid": invalid,
+        })
+        return {"source": source, "count": stored, "skipped_unknown": unknown,
+                "skipped_invalid": invalid}
+
+    def _apply_windows_tx(self, source: str, items: list[dict], replaces: bool) -> tuple[int, int]:
+        with get_session() as s:
+            if replaces:
+                s.execute(
+                    delete(MaintenanceEntry).where(
+                        MaintenanceEntry.source == source, MaintenanceEntry.kind == "window"
+                    )
+                )
+            by_uuid: dict[str, dict] = {}
+            unknown = 0
+            for item in items:
+                entity = self._resolve_live(s, item["ci_id"])
+                if entity is None:
+                    unknown += 1
+                    continue
+                by_uuid[entity.uuid] = item  # two tombstones of one entity: last wins
+            existing: dict[str, MaintenanceEntry] = {}
+            if by_uuid and not replaces:
+                existing = {
+                    row.entity_uuid: row
+                    for row in s.execute(
+                        select(MaintenanceEntry).where(
+                            MaintenanceEntry.kind == "window",
+                            MaintenanceEntry.source == source,
+                            MaintenanceEntry.entity_uuid.in_(list(by_uuid)),
+                        )
+                    ).scalars()
+                }
+            now = _now()
+            for uuid, item in by_uuid.items():
+                row = existing.get(uuid)
+                if row is None:
+                    row = MaintenanceEntry(entity_uuid=uuid, kind="window", source=source, override_id="")
+                    s.add(row)
+                row.windows = item["windows"]
+                row.inherited_from = item["inherited_from"]
+                row.deploy_policy = item["deploy_policy"]
+                row.incidents = item["incidents"]
+                row.updated_at = now
+            s.commit()
+            return len(by_uuid), unknown
+
+    def start_override(self, payload: dict) -> dict:
+        """Upsert one override row per ``(entity, source, override_id)`` for
+        every known ``ci_id`` (``maintenance:override_started``)."""
+        self._require_ready()
+        try:
+            ov = mwx.parse_override_started(payload)
+        except mwx.MaintenancePayloadError as exc:
+            raise RegistryError(str(exc)) from exc
+        stored, unknown = self._write(lambda: self._start_override_tx(ov), what="start_override")
+        self._purge_quietly()
+        self._emit(MAINTENANCE_CHANGED_TOPIC, {
+            "source": ov["source"], "kind": "override", "override_id": ov["override_id"],
+            "count": stored, "skipped_unknown": unknown,
+        })
+        return {"override_id": ov["override_id"], "source": ov["source"], "count": stored,
+                "skipped_unknown": unknown}
+
+    def _start_override_tx(self, ov: dict) -> tuple[int, int]:
+        with get_session() as s:
+            targets: dict[str, None] = {}
+            unknown = 0
+            for ci_id in ov["ci_ids"]:
+                entity = self._resolve_live(s, ci_id)
+                if entity is None:
+                    unknown += 1
+                else:
+                    targets[entity.uuid] = None
+            rows: dict[str, MaintenanceEntry] = {}
+            if targets:
+                rows = {
+                    row.entity_uuid: row
+                    for row in s.execute(
+                        select(MaintenanceEntry).where(
+                            MaintenanceEntry.kind == "override",
+                            MaintenanceEntry.source == ov["source"],
+                            MaintenanceEntry.override_id == ov["override_id"],
+                            MaintenanceEntry.entity_uuid.in_(list(targets)),
+                        )
+                    ).scalars()
+                }
+            now = _now()
+            for uuid in targets:
+                row = rows.get(uuid)
+                if row is None:
+                    row = MaintenanceEntry(
+                        entity_uuid=uuid, kind="override", source=ov["source"],
+                        override_id=ov["override_id"],
+                    )
+                    s.add(row)
+                row.until = mwx.to_db(ov["until"])
+                row.started_at = mwx.to_db(ov["started_at"])
+                row.linger_minutes = ov["linger_minutes"]
+                row.reason = ov["reason"] or None
+                # ended_at is left alone: a re-delivered "started" after the
+                # "ended" was processed must not revive the override.
+                row.updated_at = now
+            s.commit()
+            return len(targets), unknown
+
+    def end_override(self, payload: dict) -> dict:
+        """Mark every row of an override as ended (``maintenance:override_ended``);
+        it keeps counting as active for ``linger_minutes`` and expires by itself."""
+        self._require_ready()
+        try:
+            ov = mwx.parse_override_ended(payload)
+        except mwx.MaintenancePayloadError as exc:
+            raise RegistryError(str(exc)) from exc
+        count = self._write(lambda: self._end_override_tx(ov), what="end_override")
+        self._purge_quietly()
+        self._emit(MAINTENANCE_CHANGED_TOPIC, {
+            "source": ov["source"], "kind": "override", "override_id": ov["override_id"],
+            "count": count, "ended": True,
+        })
+        return {"override_id": ov["override_id"], "count": count}
+
+    def _end_override_tx(self, ov: dict) -> int:
+        with get_session() as s:
+            stmt = select(MaintenanceEntry).where(
+                MaintenanceEntry.kind == "override",
+                MaintenanceEntry.override_id == ov["override_id"],
+            )
+            if ov["source"]:  # never end another emitter's override
+                stmt = stmt.where(MaintenanceEntry.source == ov["source"])
+            rows = s.execute(stmt).scalars().all()
+            now = _now()
+            for row in rows:
+                if row.ended_at is None:  # first "ended" wins — idempotent on re-delivery
+                    row.ended_at = mwx.to_db(ov["ended_at"])
+                if ov["linger_minutes"] is not None:
+                    row.linger_minutes = ov["linger_minutes"]
+                elif row.linger_minutes is None:
+                    row.linger_minutes = mwx.DEFAULT_LINGER_MINUTES
+                row.updated_at = now
+            s.commit()
+            return len(rows)
+
+    def purge_expired(self, now: datetime | None = None) -> int:
+        """Delete override rows whose effective end lies more than ``PURGE_GRACE``
+        in the past. ``ended_at + linger`` is not expressible portably in SQL, so
+        ended rows get a second day of grace (linger is minutes, never days)."""
+        self._require_ready()
+        now = now or mwx.utcnow()
+        open_cutoff = mwx.to_db(now - PURGE_GRACE)
+        ended_cutoff = mwx.to_db(now - 2 * PURGE_GRACE)
+
+        def _tx() -> int:
+            with get_session() as s:
+                res = s.execute(
+                    delete(MaintenanceEntry).where(
+                        MaintenanceEntry.kind == "override",
+                        or_(
+                            (MaintenanceEntry.ended_at.is_(None)) & (MaintenanceEntry.until < open_cutoff),
+                            (MaintenanceEntry.ended_at.is_not(None)) & (MaintenanceEntry.ended_at < ended_cutoff),
+                        ),
+                    )
+                )
+                s.commit()
+                return int(res.rowcount or 0)
+
+        removed = self._write(_tx, what="purge_expired")
+        if removed:
+            log.info(f"EntityRegistry: purged {removed} expired maintenance override(s)")
+        return removed
+
+    def _purge_quietly(self) -> None:
+        """Housekeeping must never fail the event that triggered it."""
+        try:
+            self.purge_expired()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug(f"EntityRegistry: purge_expired skipped — {exc}")
+
+    def maintenance_for(self, s, uuids: list[str], now: datetime | None = None) -> dict[str, dict]:
+        """Read-model state for several entities — one ``IN`` query, evaluated now.
+
+        Every requested uuid is a key; entities without rows get the empty
+        state (``active: False``). See ``maintenance.evaluate`` for the shape.
+        """
+        now = now or mwx.utcnow()
+        out = {u: mwx.empty_state() for u in uuids}
+        if not uuids:
+            return out
+        rows = s.execute(
+            select(MaintenanceEntry)
+            .where(MaintenanceEntry.entity_uuid.in_(uuids))
+            .order_by(MaintenanceEntry.source, MaintenanceEntry.id)
+        ).scalars().all()
+        grouped: dict[str, tuple[list, list]] = {}
+        for row in rows:
+            wins, ovs = grouped.setdefault(row.entity_uuid, ([], []))
+            (wins if row.kind == "window" else ovs).append(row)
+        for uuid, (wins, ovs) in grouped.items():
+            out[uuid] = mwx.evaluate(wins, ovs, now)
+        return out
+
+    def get_maintenance(self, ci_ids: list[str], now: datetime | None = None) -> dict:
+        """Batch read-model for consumers (``GET /maintenance?ci_ids=``).
+
+        Keys are the ids as requested; merge tombstones resolve to the survivor's
+        state, unknown ids map to ``None``.
+        """
+        self._require_ready()
+        now = now or mwx.utcnow()
+        ids = list(dict.fromkeys(c.strip() for c in ci_ids if isinstance(c, str) and c.strip()))
+        with get_session() as s:
+            found = {
+                e.uuid: e
+                for e in s.execute(select(Entity).where(Entity.uuid.in_(ids))).scalars()
+            } if ids else {}
+            live_of: dict[str, str | None] = {}
+            for ci_id in ids:
+                entity = found.get(ci_id)
+                if entity is not None and entity.status == "merged":
+                    entity = self._resolve_live(s, ci_id)
+                live_of[ci_id] = entity.uuid if entity is not None else None
+            states = self.maintenance_for(s, sorted({u for u in live_of.values() if u}), now)
+        return {
+            "now": mwx.iso(now),
+            "maintenance": {
+                ci_id: ({**states[live], "uuid": live} if live else None)
+                for ci_id, live in live_of.items()
+            },
+        }
 
     # ── Conflicts ────────────────────────────────────────────────────────────
 

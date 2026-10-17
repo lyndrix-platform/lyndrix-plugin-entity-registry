@@ -60,6 +60,45 @@
     "itsmNewIncident": "New incident",
     "itsmAll": "All records"
   },
+  "maintenance": {
+    "badge": "Maintenance",
+    "title": "Maintenance",
+    "hint": "Windows and overrides other plugins published for this configuration item (IaC orchestrator, monitoring). Evaluated when read; the registry owns none of it.",
+    "activeUntil": "In maintenance until {{until}}",
+    "activeOpenEnd": "In maintenance",
+    "none": "No maintenance window active.",
+    "nextStart": "Next window from {{start}}",
+    "unavailable": "This core cannot evaluate windows (API < 1.13) — showing the published raw data.",
+    "sourceWindow": "window",
+    "sourceOverride": "override",
+    "until": "until",
+    "overrides": "Active overrides",
+    "noReason": "no reason given",
+    "windows": "Published windows",
+    "noWindows": "No windows published for this item.",
+    "inheritedFrom": "inherited from {{from}}",
+    "inherited": {
+      "host": "host",
+      "stage_default": "stage default",
+      "site_default": "site default"
+    },
+    "incidentRule": "Incident rule",
+    "incidentDisabled": "disabled",
+    "incidentSummary": "incident after {{minutes}} min offline · severity {{severity}}",
+    "autoResolve": "auto-resolve",
+    "deployPolicy": "Deploy policy",
+    "onlyActive": "In maintenance only",
+    "minutes": "{{count}} min",
+    "days": {
+      "mon": "Mon",
+      "tue": "Tue",
+      "wed": "Wed",
+      "thu": "Thu",
+      "fri": "Fri",
+      "sat": "Sat",
+      "sun": "Sun"
+    }
+  },
   "conflicts": {
     "title": "Open conflicts",
     "hint": "One observation matched several entities. The registry never merges automatically — pick the entity to keep, or dismiss if they really are different things.",

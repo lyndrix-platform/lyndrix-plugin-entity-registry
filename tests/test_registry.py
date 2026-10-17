@@ -1,48 +1,16 @@
-"""Entity Registry service tests — real service against in-memory SQLite."""
+"""Entity Registry service tests — real service against in-memory SQLite.
+
+The ``svc`` fixture (service + in-memory SQLite + recording ctx) lives in
+``conftest.py`` and is shared with ``test_maintenance.py``.
+"""
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-
-class _FakeCtx:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, dict]] = []
-        self.cluster_topics: list[str] = []
-
-    def emit(self, topic, payload, cluster=False):
-        self.events.append((topic, payload))
-        if cluster:
-            self.cluster_topics.append(topic)
-
-    def topics(self) -> list[str]:
-        return [t for t, _ in self.events]
-
-
-@pytest.fixture()
-def svc(monkeypatch):
-    from app.logic.service import EntityRegistryService
-    from app.model import database
-
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
-    # Enforce FKs like MariaDB does, so flush-order bugs fail here too.
-    event.listen(engine, "connect", lambda conn, _rec: conn.execute("PRAGMA foreign_keys=ON"))
-    monkeypatch.setattr(
-        database, "db_instance",
-        SimpleNamespace(engine=engine, SessionLocal=sessionmaker(bind=engine), is_connected=True),
-    )
-    service = EntityRegistryService()
-    service.set_context(_FakeCtx())
-    service.catalog.load()
-    service.on_db_connected()
-    return service
-
 
 SRC = "iac-orchestrator"
 

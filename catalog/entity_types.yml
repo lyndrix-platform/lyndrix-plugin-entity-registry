@@ -56,6 +56,10 @@ identifier_schemes:
     label: IaC inventory host key
     description: The YAML key under hosts in the IaC controller SSoT.
     priority: 20
+  - id: iac.service
+    label: IaC service instance
+    description: "<host>/<service-name> — a service.yml deployed on one host."
+    priority: 20
   - id: fqdn
     label: FQDN
     priority: 30

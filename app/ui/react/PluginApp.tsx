@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 // from locales/entity_registry.<locale>.json (namespace "entity_registry").
 import { useTranslation } from 'react-i18next'
 import { itsmApi, registryApi, spaRedirect } from './lib/api'
-import type { Catalog, Conflict, Entity, ItsmRecordSummary, Stats } from './lib/api'
+import type { Catalog, Conflict, Entity, ItsmRecordSummary, MaintenanceState, MaintenanceWindow, Stats } from './lib/api'
 
 // ─── Small shared pieces ──────────────────────────────────────────────────────
 
@@ -59,6 +59,23 @@ function StatusBadge({ status }: { status: Entity['status'] }) {
   )
 }
 
+function MaintenanceBadge({ m }: { m?: MaintenanceState | null }) {
+  const { t } = useTranslation('entity_registry')
+  if (!m || !m.active) return null
+  const src = m.source === 'override'
+    ? t('maintenance.sourceOverride', { defaultValue: 'override' })
+    : t('maintenance.sourceWindow', { defaultValue: 'window' })
+  const title = m.until ? `${src} · ${t('maintenance.until', { defaultValue: 'until' })} ${fmt(m.until)}` : src
+  // lx-badge--maintenance exists on shells >= ui 1.8 and overrides the paused
+  // colour; an older shell simply keeps lx-badge--paused.
+  return (
+    <span className="lx-badge lx-badge--paused lx-badge--maintenance" title={title}>
+      <span className="material-icons" style={{ fontSize: 13 }}>engineering</span>
+      {t('maintenance.badge', { defaultValue: 'Maintenance' })}
+    </span>
+  )
+}
+
 function IdentChip({ scheme, value }: { scheme: string; value: string }) {
   return (
     <span className="lx-badge lx-badge--muted lx-mono" style={{ fontSize: '0.68rem' }} title={`${scheme} = ${value}`}>
@@ -103,6 +120,130 @@ function useCatalog() {
   return catalog
 }
 
+// ─── Maintenance read-model (detail card) ─────────────────────────────────────
+
+const DAY_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+
+/** One normal-form window as a short human line. */
+function describeWindow(w: MaintenanceWindow, t: (k: string, o?: Record<string, unknown>) => string): string {
+  if (w.type === 'weekly') {
+    const days = w.days
+      .map((d) => (typeof d === 'number' ? DAY_KEYS[d] : String(d).slice(0, 3).toLowerCase()))
+      .map((k) => t(`maintenance.days.${k}`, { defaultValue: k }))
+    return `${days.join(', ')} ${w.start}–${w.end}${w.tz ? ` (${w.tz})` : ''}`
+  }
+  if (w.type === 'once') return `${fmt(w.start)} – ${fmt(w.end)}${w.note ? ` · ${w.note}` : ''}`
+  if (w.type === 'cron') return `cron ${w.expr} · ${t('maintenance.minutes', { defaultValue: '{{count}} min', count: w.duration_minutes })}${w.tz ? ` (${w.tz})` : ''}`
+  return JSON.stringify(w)
+}
+
+function MaintenanceCard({ m }: { m?: MaintenanceState }) {
+  const { t } = useTranslation('entity_registry')
+  const windows = m?.windows ?? []
+  const overrides = m?.overrides ?? []
+  const rule = m?.incidents ?? null
+  const muted = { fontSize: '0.8rem', color: 'var(--lx-text-muted)' } as const
+  return (
+    <div className="lx-card" style={{ padding: '1rem' }}>
+      <div className="lx-section-title">{t('maintenance.title', { defaultValue: 'Maintenance' })}</div>
+      <p style={{ fontSize: '0.78rem', color: 'var(--lx-text-muted)', margin: '0 0 0.5rem' }}>
+        {t('maintenance.hint', { defaultValue: 'Windows and overrides other plugins published for this configuration item. Evaluated when read; the registry owns none of it.' })}
+      </p>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+        {m?.active ? (
+          <>
+            <MaintenanceBadge m={m} />
+            <span style={{ color: 'var(--lx-text)' }}>
+              {m.until
+                ? t('maintenance.activeUntil', { defaultValue: 'In maintenance until {{until}}', until: fmt(m.until) })
+                : t('maintenance.activeOpenEnd', { defaultValue: 'In maintenance' })}
+            </span>
+            {m.note && <span style={muted}>· {m.note}</span>}
+          </>
+        ) : m?.active === null ? (
+          <span style={muted}>{t('maintenance.unavailable', { defaultValue: 'This core cannot evaluate windows (API < 1.13) — showing the published raw data.' })}</span>
+        ) : (
+          <span style={muted}>{t('maintenance.none', { defaultValue: 'No maintenance window active.' })}</span>
+        )}
+      </div>
+      {m?.next_start && (
+        <div style={{ ...muted, marginTop: '0.3rem' }}>
+          <span className="material-icons" style={{ fontSize: 14, verticalAlign: 'text-bottom' }}>schedule</span>{' '}
+          {t('maintenance.nextStart', { defaultValue: 'Next window from {{start}}', start: fmt(m.next_start) })}
+        </div>
+      )}
+
+      {overrides.length > 0 && (
+        <>
+          <div className="lx-section-title" style={{ marginTop: '1rem' }}>{t('maintenance.overrides', { defaultValue: 'Active overrides' })}</div>
+          {overrides.map((o) => (
+            <div key={`${o.source}:${o.id}`} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.8rem', padding: '0.2rem 0', flexWrap: 'wrap' }}>
+              <span className="material-icons" style={{ fontSize: 16, color: 'var(--lx-state-maintenance, var(--lx-state-paused))' }}>engineering</span>
+              <span style={{ flex: 1, minWidth: 160 }}>{o.reason || t('maintenance.noReason', { defaultValue: 'no reason given' })}</span>
+              <span className="lx-badge lx-badge--muted">{o.source}</span>
+              <span style={muted}>{t('maintenance.until', { defaultValue: 'until' })} {fmt(o.until)}</span>
+            </div>
+          ))}
+        </>
+      )}
+
+      <div className="lx-section-title" style={{ marginTop: '1rem' }}>{t('maintenance.windows', { defaultValue: 'Published windows' })}</div>
+      {windows.length === 0 ? (
+        <div style={muted}>{t('maintenance.noWindows', { defaultValue: 'No windows published for this item.' })}</div>
+      ) : (
+        windows.map((ws) => (
+          <div key={ws.source} style={{ padding: '0.3rem 0', fontSize: '0.8rem' }}>
+            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className="lx-badge lx-badge--muted">{ws.source}</span>
+              {ws.inherited_from && (
+                <span style={muted}>
+                  {t('maintenance.inheritedFrom', {
+                    defaultValue: 'inherited from {{from}}',
+                    from: t(`maintenance.inherited.${ws.inherited_from}`, { defaultValue: ws.inherited_from }),
+                  })}
+                </span>
+              )}
+            </div>
+            {ws.windows.length === 0 ? (
+              <div style={{ ...muted, paddingLeft: '0.25rem' }}>—</div>
+            ) : (
+              <ul style={{ margin: '0.2rem 0 0', paddingLeft: '1.1rem' }}>
+                {ws.windows.map((w, i) => <li key={i} className="lx-mono" style={{ fontSize: '0.75rem' }}>{describeWindow(w, t)}</li>)}
+              </ul>
+            )}
+          </div>
+        ))
+      )}
+
+      {(rule || m?.deploy_policy) && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '0.35rem 0.75rem', fontSize: '0.8rem', marginTop: '0.75rem' }}>
+          {rule && (
+            <>
+              <span className="lx-label">{t('maintenance.incidentRule', { defaultValue: 'Incident rule' })}</span>
+              <span>
+                {rule.enabled === false
+                  ? t('maintenance.incidentDisabled', { defaultValue: 'disabled' })
+                  : t('maintenance.incidentSummary', {
+                      defaultValue: 'incident after {{minutes}} min offline · severity {{severity}}',
+                      minutes: rule.offline_minutes ?? '?', severity: rule.severity ?? '?',
+                    })}
+                {rule.enabled !== false && rule.auto_resolve && <span style={muted}> · {t('maintenance.autoResolve', { defaultValue: 'auto-resolve' })}</span>}
+              </span>
+            </>
+          )}
+          {m?.deploy_policy && (
+            <>
+              <span className="lx-label">{t('maintenance.deployPolicy', { defaultValue: 'Deploy policy' })}</span>
+              <span className="lx-mono">{m.deploy_policy}</span>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Views ────────────────────────────────────────────────────────────────────
 
 type View = { kind: 'list' } | { kind: 'detail'; uuid: string } | { kind: 'conflicts' }
@@ -137,6 +278,7 @@ function EntityList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (uui
   const [q, setQ] = useState('')
   const [type, setType] = useState('')
   const [status, setStatus] = useState('active')
+  const [onlyMaint, setOnlyMaint] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -144,7 +286,9 @@ function EntityList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (uui
     setLoading(true)
     setError(null)
     try {
-      const res = await registryApi.listEntities({ q: q.trim() || undefined, type: type || undefined, status, limit: 500 })
+      const res = await registryApi.listEntities({
+        q: q.trim() || undefined, type: type || undefined, status, limit: 500, in_maintenance: onlyMaint || undefined,
+      })
       setEntities(res.entities)
       setTotal(res.total)
     } catch (err) {
@@ -152,7 +296,7 @@ function EntityList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (uui
     } finally {
       setLoading(false)
     }
-  }, [q, type, status])
+  }, [q, type, status, onlyMaint])
 
   useEffect(() => {
     const h = window.setTimeout(() => void load(), q ? 250 : 0)
@@ -178,6 +322,12 @@ function EntityList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (uui
           <option value="retired">{t('status.retired', { defaultValue: 'retired' })}</option>
           <option value="all">{t('list.allStatuses', { defaultValue: 'all' })}</option>
         </select>
+        <Button
+          label={t('maintenance.onlyActive', { defaultValue: 'In maintenance only' })}
+          icon="engineering"
+          variant={onlyMaint ? 'primary' : 'default'}
+          onClick={() => setOnlyMaint((v) => !v)}
+        />
         <Button label={t('common.refresh', { defaultValue: 'Refresh' })} icon="refresh" onClick={() => void load()} />
       </div>
       {error && <ErrorBox msg={error} />}
@@ -204,7 +354,11 @@ function EntityList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (uui
                     <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>{e.display_name}</div>
                     <Mono>{e.uuid}</Mono>
                   </td>
-                  <td><TypeBadge type={e.entity_type} catalog={catalog} /> {e.status !== 'active' && <StatusBadge status={e.status} />}</td>
+                  <td>
+                    <TypeBadge type={e.entity_type} catalog={catalog} />{' '}
+                    {e.status !== 'active' && <StatusBadge status={e.status} />}{' '}
+                    <MaintenanceBadge m={e.maintenance} />
+                  </td>
                   <td style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem', maxWidth: 420 }}>
                     {e.identifiers.slice(0, 4).map((i) => <IdentChip key={`${i.scheme}:${i.value}`} scheme={i.scheme} value={i.value} />)}
                     {e.identifiers.length > 4 && <span className="lx-badge lx-badge--muted">+{e.identifiers.length - 4}</span>}
@@ -283,6 +437,7 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
             <h2 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--lx-text)' }}>{entity.display_name}</h2>
             <TypeBadge type={entity.entity_type} catalog={catalog} />
             <StatusBadge status={entity.status} />
+            <MaintenanceBadge m={entity.maintenance} />
           </>
         )}
       </div>
@@ -363,6 +518,8 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
                 onClick={() => void run(async () => { await registryApi.addRelation(entity.uuid, relTo.trim(), relKind); setRelTo('') })} />
             </div>
           </div>
+
+          <MaintenanceCard m={entity.maintenance} />
 
           {itsm !== null && (
             <div className="lx-card" style={{ padding: '1rem' }}>

@@ -9,6 +9,10 @@ Identifier  — (scheme, value) → entity. Exactly one owner per pair, enforced
 Relation    — directed, labelled edge between two entities.
 Conflict    — an identify() call whose identifiers pointed at several
               entities; parked for an admin to merge or dismiss.
+MaintenanceEntry — read-model of the maintenance-window feature: one row per
+              (entity, source) with the published windows, one row per
+              (entity, source, override_id) for a running override. Evaluated
+              at read time, never a source of truth (0.3.0).
 """
 from __future__ import annotations
 
@@ -157,4 +161,68 @@ class Conflict(_Base):
             "resolution": self.resolution,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+
+class MaintenanceEntry(_Base):
+    """What ``maintenance:windows_published`` / ``override_started`` delivered.
+
+    ``kind="window"``   — the window set one ``source`` published for the entity
+                          (``override_id`` is ``""``, so the unique key holds —
+                          NULLs never collide in a unique index).
+    ``kind="override"`` — one running/ended override (``override_id`` set).
+
+    All datetimes are naive UTC (MariaDB ``DateTime`` has no zone). Rows are
+    written idempotently (delete+insert per source, upsert per override) so a
+    duplicate delivery on another instance ends in the same state.
+    """
+
+    __tablename__ = "registry_maintenance"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_uuid", "source", "kind", "override_id", name="uq_registry_maintenance"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    entity_uuid = Column(
+        String(36), ForeignKey("registry_entities.uuid"), nullable=False, index=True
+    )
+    # window | override
+    kind = Column(String(16), nullable=False)
+    # Emitting plugin ("iac-orchestrator", "monitoring", ...).
+    source = Column(String(64), nullable=False, default="")
+    override_id = Column(String(64), nullable=False, default="")
+    # kind="window": normal-form windows [{type, ...}], inheritance, policy, rule.
+    windows = Column(JSON, nullable=True)
+    inherited_from = Column(String(32), nullable=True)
+    deploy_policy = Column(String(16), nullable=True)
+    incidents = Column(JSON, nullable=True)
+    # kind="override": active from started_at until `until`, after ended_at for
+    # linger_minutes more.
+    until = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+    linger_minutes = Column(Integer, nullable=True)
+    reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+
+    def to_dict(self) -> dict:
+        iso = lambda dt: dt.isoformat() if dt else None  # noqa: E731
+        return {
+            "id": self.id,
+            "entity_uuid": self.entity_uuid,
+            "kind": self.kind,
+            "source": self.source,
+            "override_id": self.override_id or None,
+            "windows": list(self.windows or []),
+            "inherited_from": self.inherited_from,
+            "deploy_policy": self.deploy_policy,
+            "incidents": dict(self.incidents) if self.incidents else None,
+            "until": iso(self.until),
+            "started_at": iso(self.started_at),
+            "ended_at": iso(self.ended_at),
+            "linger_minutes": self.linger_minutes,
+            "reason": self.reason,
+            "updated_at": iso(self.updated_at),
         }

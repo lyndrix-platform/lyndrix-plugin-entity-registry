@@ -60,6 +60,45 @@
     "itsmNewIncident": "Neuer Incident",
     "itsmAll": "Alle Datensätze"
   },
+  "maintenance": {
+    "badge": "Wartung",
+    "title": "Wartung",
+    "hint": "Fenster und Overrides, die andere Plugins für dieses Configuration Item veröffentlicht haben (IaC-Orchestrator, Monitoring). Wird beim Lesen ausgewertet; die Registry besitzt nichts davon.",
+    "activeUntil": "In Wartung bis {{until}}",
+    "activeOpenEnd": "In Wartung",
+    "none": "Kein Wartungsfenster aktiv.",
+    "nextStart": "Nächstes Fenster ab {{start}}",
+    "unavailable": "Dieser Core kann Fenster nicht auswerten (API < 1.13) — es werden die veröffentlichten Rohdaten gezeigt.",
+    "sourceWindow": "Fenster",
+    "sourceOverride": "Override",
+    "until": "bis",
+    "overrides": "Aktive Overrides",
+    "noReason": "kein Grund angegeben",
+    "windows": "Veröffentlichte Fenster",
+    "noWindows": "Keine Fenster für dieses Item veröffentlicht.",
+    "inheritedFrom": "geerbt von {{from}}",
+    "inherited": {
+      "host": "Host",
+      "stage_default": "Stage-Default",
+      "site_default": "Site-Default"
+    },
+    "incidentRule": "Incident-Regel",
+    "incidentDisabled": "deaktiviert",
+    "incidentSummary": "Incident nach {{minutes}} min offline · Schwere {{severity}}",
+    "autoResolve": "Auto-Resolve",
+    "deployPolicy": "Deploy-Policy",
+    "onlyActive": "Nur in Wartung",
+    "minutes": "{{count}} min",
+    "days": {
+      "mon": "Mo",
+      "tue": "Di",
+      "wed": "Mi",
+      "thu": "Do",
+      "fri": "Fr",
+      "sat": "Sa",
+      "sun": "So"
+    }
+  },
   "conflicts": {
     "title": "Offene Konflikte",
     "hint": "Eine Beobachtung passte auf mehrere Entitäten. Die Registry führt nie automatisch zusammen — wähle die Entität, die bleibt, oder verwerfe den Konflikt, wenn es wirklich verschiedene Dinge sind.",

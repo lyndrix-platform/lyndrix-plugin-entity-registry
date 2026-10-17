@@ -20,6 +20,9 @@ from ..logic.service import EntityRegistryService, NotFound, RegistryError
 PLUGIN_ID = "lyndrix.plugin.entity_registry"
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
+# GET /maintenance?ci_ids= — one IN query; keeps a careless consumer from
+# asking for the whole registry in one request.
+MAX_MAINTENANCE_BATCH = 200
 
 
 # ── Payloads ───────────────────────────────────────────────────────────────────
@@ -92,11 +95,15 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
         status: str = "active",
         limit: int = Query(200, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        in_maintenance: Optional[bool] = None,
         identity: ApiIdentity = Depends(require_permission(PERM_READ)),
     ):
+        """``in_maintenance=true`` keeps only entities whose maintenance state is
+        active right now (evaluated per page — ``total`` is then the page's count)."""
         _ensure_ready()
         return await _call(
-            service.list_entities, entity_type=type, q=q, status=status, limit=limit, offset=offset
+            service.list_entities, entity_type=type, q=q, status=status, limit=limit, offset=offset,
+            in_maintenance=in_maintenance,
         )
 
     @router.get("/entities/{uuid}")
@@ -106,6 +113,37 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
         if entity is None:
             raise HTTPException(status_code=404, detail=f"Unknown entity: {uuid}")
         return {"entity": entity}
+
+    @router.get("/entities/{uuid}/host")
+    async def get_entity_host(
+        uuid: str, identity: ApiIdentity = Depends(require_permission(PERM_READ))
+    ):
+        """The host a service/container runs on (its outgoing ``runs_on``
+        relation): ``{host, relation}``. 404 when the entity is unknown or has
+        no ``runs_on`` relation."""
+        _ensure_ready()
+        res = await _call(service.host_of, uuid)
+        if res is None:
+            raise HTTPException(status_code=404, detail=f"No runs_on relation for entity: {uuid}")
+        return res
+
+    # ── Maintenance read-model ─────────────────────────────────────────────────
+    @router.get("/maintenance")
+    async def maintenance_batch(
+        ci_ids: str = Query(min_length=1, description="comma-separated entity UUIDs (max 200)"),
+        identity: ApiIdentity = Depends(require_permission(PERM_READ)),
+    ):
+        """Batch read-model for consumers: ``{now, maintenance: {ci_id: state | null}}``.
+        Merge tombstones resolve to the survivor; unknown ids are ``null``."""
+        _ensure_ready()
+        ids = list(dict.fromkeys(c.strip() for c in ci_ids.split(",") if c.strip()))
+        if not ids:
+            raise HTTPException(status_code=400, detail="ci_ids must name at least one entity")
+        if len(ids) > MAX_MAINTENANCE_BATCH:
+            raise HTTPException(
+                status_code=400, detail=f"ci_ids: at most {MAX_MAINTENANCE_BATCH} ids per request"
+            )
+        return await _call(service.get_maintenance, ids)
 
     @router.patch("/entities/{uuid}")
     async def update_entity(

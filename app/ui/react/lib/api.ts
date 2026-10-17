@@ -24,6 +24,57 @@ export interface RelationView {
   other_entity_type: string | null
 }
 
+// ─── Maintenance read-model (core API 1.13 contract, evaluated server-side) ───
+
+export interface WeeklyWindow { type: 'weekly'; days: (string | number)[]; start: string; end: string; tz?: string }
+export interface OnceWindow { type: 'once'; start: string; end: string; note?: string }
+export interface CronWindow { type: 'cron'; expr: string; duration_minutes: number; tz?: string }
+export type MaintenanceWindow = WeeklyWindow | OnceWindow | CronWindow
+
+export interface IncidentRule {
+  enabled: boolean
+  offline_minutes?: number
+  severity?: string
+  auto_resolve?: boolean
+}
+
+/** One emitter's published window set for an entity. */
+export interface MaintenanceWindowSource {
+  source: string
+  windows: MaintenanceWindow[]
+  inherited_from: string | null
+  deploy_policy: string | null
+  incidents: IncidentRule | null
+  updated_at: string | null
+}
+
+/** A currently active override (a running deploy, a manual override). */
+export interface MaintenanceOverride {
+  id: string
+  source: string
+  until: string | null
+  started_at: string | null
+  ended_at: string | null
+  linger_minutes: number | null
+  reason: string
+}
+
+/**
+ * `active === null` means the core cannot evaluate windows (API < 1.13):
+ * the raw data is still there, only the verdict is missing.
+ */
+export interface MaintenanceState {
+  active: boolean | null
+  until: string | null
+  source: 'window' | 'override' | null
+  next_start?: string | null
+  note?: string | null
+  windows?: MaintenanceWindowSource[]
+  overrides?: MaintenanceOverride[]
+  incidents?: IncidentRule | null
+  deploy_policy?: string | null
+}
+
 export interface Entity {
   uuid: string
   entity_type: string
@@ -38,6 +89,8 @@ export interface Entity {
   last_seen_at: string | null
   identifiers: Identifier[]
   relations?: RelationView[]
+  // Compact {active, until, source} on list rows, the full state on the detail.
+  maintenance?: MaintenanceState
 }
 
 export interface ConflictCandidate {
@@ -121,16 +174,24 @@ const enc = (v: string | number) => encodeURIComponent(String(v))
 const base = (sub: string) => `/api/plugins/${PLUGIN_ID}/${sub}`
 
 export const registryApi = {
-  listEntities: (p: { type?: string; q?: string; status?: string; limit?: number; offset?: number }) => {
+  listEntities: (p: { type?: string; q?: string; status?: string; limit?: number; offset?: number; in_maintenance?: boolean }) => {
     const qs = new URLSearchParams()
     if (p.type) qs.set('type', p.type)
     if (p.q) qs.set('q', p.q)
     if (p.status) qs.set('status', p.status)
     if (p.limit) qs.set('limit', String(p.limit))
     if (p.offset) qs.set('offset', String(p.offset))
+    if (p.in_maintenance) qs.set('in_maintenance', 'true')
     return apiFetch<{ total: number; entities: Entity[] }>(base(`entities?${qs}`))
   },
   getEntity: (uuid: string) => apiFetch<{ entity: Entity }>(base(`entities/${enc(uuid)}`)),
+  /** The host a service/container runs on (outgoing `runs_on`); 404 → rejects. */
+  getHost: (uuid: string) => apiFetch<{ host: Entity; relation: RelationView }>(base(`entities/${enc(uuid)}/host`)),
+  /** Batch maintenance states keyed by the requested ids (max 200; unknown → null). */
+  getMaintenance: (ids: string[]) =>
+    apiFetch<{ now: string; maintenance: Record<string, (MaintenanceState & { uuid: string }) | null> }>(
+      base(`maintenance?ci_ids=${encodeURIComponent(ids.join(','))}`),
+    ),
   updateEntity: (uuid: string, body: { display_name?: string; attributes?: Record<string, unknown> }) =>
     apiFetch<{ entity: Entity }>(base(`entities/${enc(uuid)}`), { method: 'PATCH', body: JSON.stringify(body) }),
   retire: (uuid: string) => apiFetch<{ entity: Entity }>(base(`entities/${enc(uuid)}/retire`), { method: 'POST' }),

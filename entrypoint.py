@@ -35,6 +35,15 @@ Events consumed
   entity_registry:retire     — {uuid, source?}
   entity_registry:catalog_reloaded — cluster-wide (see below); a peer's reload
                                (payload["_origin"] set) re-reads the catalog here.
+  maintenance:windows_published — {source, published_at, replaces, items: [
+                               {ci_id, kind, name, windows, inherited_from,
+                                deploy_policy?, incidents?, host_ci_id?}]}
+                               Read-model feed (core API 1.13 contract): the
+                               source's window set is replaced in one
+                               transaction; unknown ci_ids are skipped.
+  maintenance:override_started — {override_id, ci_ids, until, reason, source,
+                               started_at, linger_minutes}
+  maintenance:override_ended   — {override_id, source, ended_at, linger_minutes}
 
 Events emitted
 --------------
@@ -48,13 +57,18 @@ Events emitted
   entity_registry:ingest_failed  — {topic, error, payload_keys}
   entity_registry:catalog_reloaded — {reloaded_at}, cluster=True, after an
                                    operator-triggered POST /catalog/reload
+  entity_registry:maintenance_changed — {source, kind: window|override, count,
+                                   override_id?, ...} once per processed
+                                   maintenance:* event (UIs refresh on it)
 
 Cluster
 -------
 Routes and bus handlers run on every instance; all state lives in the shared
 DB. Bootstrap DDL is serialized with the core bootstrap lock, writes run READ
 COMMITTED with a 1020/1205/1213 retry, and unique-key races (identifier,
-open conflict) are resolved by re-reading the winner's row.
+open conflict) are resolved by re-reading the winner's row. maintenance:*
+events arrive locally (the emitter's instance) and are persisted idempotently,
+so a later switch to cluster-wide emission needs no change here.
 """
 import asyncio
 import time
@@ -62,17 +76,21 @@ import time
 from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api import IdentifyPayload, RegisterPayload, build_plugin_router
-from .app.logic.service import CATALOG_RELOADED_TOPIC, NotFound, RegistryError
+from .app.logic.service import CATALOG_RELOADED_TOPIC, MAINTENANCE_CHANGED_TOPIC, NotFound, RegistryError
 from .app.logic.service import entity_registry_service as svc
 
 PLUGIN_ID = "lyndrix.plugin.entity_registry"
+
+TOPIC_WINDOWS_PUBLISHED = "maintenance:windows_published"
+TOPIC_OVERRIDE_STARTED = "maintenance:override_started"
+TOPIC_OVERRIDE_ENDED = "maintenance:override_ended"
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
 
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="Entity Registry",
-    version="0.2.0",
+    version="0.3.0",
     description=(
         "Stable UUIDs for every configuration item. Reconciles identities across "
         "plugins (IaC, Server Manager, Monitoring, ITSM) so a renamed host keeps its id."
@@ -100,6 +118,9 @@ manifest = ModuleManifest(
             "entity_registry:unrelate",
             "entity_registry:retire",
             CATALOG_RELOADED_TOPIC,
+            TOPIC_WINDOWS_PUBLISHED,
+            TOPIC_OVERRIDE_STARTED,
+            TOPIC_OVERRIDE_ENDED,
         ],
         "emit": [
             "entity_registry:identified",
@@ -111,6 +132,7 @@ manifest = ModuleManifest(
             "entity_registry:conflict",
             "entity_registry:ingest_failed",
             CATALOG_RELOADED_TOPIC,
+            MAINTENANCE_CHANGED_TOPIC,
         ],
     },
     roles=[
@@ -315,5 +337,74 @@ def setup(ctx):
             await asyncio.to_thread(svc.retire, str(data["uuid"]), source=data.get("source"))
         except Exception as exc:
             ctx.log.error(f"Entity Registry: retire failed — {exc}")
+
+    # ── Maintenance read-model (core API 1.13 contract) ──────────────────────
+    # Consumers persist idempotently; the emitter's local instance handles the
+    # event and writes the shared DB, so every instance reads the same state.
+    @ctx.subscribe(TOPIC_WINDOWS_PUBLISHED)
+    async def _on_windows_published(payload):
+        data = payload if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict) or not data.get("source") or not isinstance(data.get("items"), list):
+            _fail(TOPIC_WINDOWS_PUBLISHED, payload, "source and items[] are required")
+            return
+        if not svc.is_ready:
+            _fail(TOPIC_WINDOWS_PUBLISHED, payload, "database not ready")
+            return
+        try:
+            res = await asyncio.to_thread(
+                svc.apply_windows, str(data["source"]), data["items"],
+                replaces=bool(data.get("replaces", True)),
+            )
+            ctx.log.info(
+                f"Entity Registry: maintenance windows from '{res['source']}' — {res['count']} stored, "
+                f"{res['skipped_unknown']} unknown, {res['skipped_invalid']} invalid"
+            )
+        except RegistryError as exc:
+            _fail(TOPIC_WINDOWS_PUBLISHED, payload, str(exc))
+        except Exception as exc:
+            ctx.log.error(f"Entity Registry: windows_published failed — {exc}")
+
+    @ctx.subscribe(TOPIC_OVERRIDE_STARTED)
+    async def _on_override_started(payload):
+        data = payload if isinstance(payload, dict) else {}
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(data.get("override_id"), str)
+            or not data.get("override_id")
+            or not isinstance(data.get("ci_ids"), list)
+            or data.get("until") is None
+        ):
+            _fail(TOPIC_OVERRIDE_STARTED, payload, "override_id, ci_ids[] and until are required")
+            return
+        if not svc.is_ready:
+            _fail(TOPIC_OVERRIDE_STARTED, payload, "database not ready")
+            return
+        try:
+            res = await asyncio.to_thread(svc.start_override, data)
+            ctx.log.info(
+                f"Entity Registry: override '{res['override_id']}' from '{res['source']}' "
+                f"on {res['count']} CI(s) ({res['skipped_unknown']} unknown)"
+            )
+        except RegistryError as exc:
+            _fail(TOPIC_OVERRIDE_STARTED, payload, str(exc))
+        except Exception as exc:
+            ctx.log.error(f"Entity Registry: override_started failed — {exc}")
+
+    @ctx.subscribe(TOPIC_OVERRIDE_ENDED)
+    async def _on_override_ended(payload):
+        data = payload if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict) or not isinstance(data.get("override_id"), str) or not data.get("override_id"):
+            _fail(TOPIC_OVERRIDE_ENDED, payload, "override_id is required")
+            return
+        if not svc.is_ready:
+            _fail(TOPIC_OVERRIDE_ENDED, payload, "database not ready")
+            return
+        try:
+            res = await asyncio.to_thread(svc.end_override, data)
+            ctx.log.info(f"Entity Registry: override '{res['override_id']}' ended on {res['count']} CI(s)")
+        except RegistryError as exc:
+            _fail(TOPIC_OVERRIDE_ENDED, payload, str(exc))
+        except Exception as exc:
+            ctx.log.error(f"Entity Registry: override_ended failed — {exc}")
 
     ctx.log.info("Entity Registry: setup complete")

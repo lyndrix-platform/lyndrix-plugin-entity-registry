@@ -57,7 +57,7 @@ Events emitted
   entity_registry:ingest_failed  — {topic, error, payload_keys}
   entity_registry:catalog_reloaded — {reloaded_at}, cluster=True, after an
                                    operator-triggered POST /catalog/reload
-  entity_registry:maintenance_changed — {source, kind: window|override, count,
+  entity_registry:maintenance_changed — cluster=True; {source, kind: window|override, count,
                                    override_id?, ...} once per processed
                                    maintenance:* event (UIs refresh on it)
 

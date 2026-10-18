@@ -135,7 +135,7 @@ Ungültige Payloads (kein Objekt, Pflichtfelder fehlen, Datenbank nicht bereit) 
 `entity_updated` (`{entity, changes}`), `entity_merged` (`{keep, drop_uuid}`), `entity_retired`,
 `conflict`, `ingest_failed` (`{topic, error, payload_keys}` — Fehler bei Pushes ohne `request_id`),
 `entity_registry:catalog_reloaded` (`{reloaded_at}`, clusterweit nach `POST /catalog/reload`),
-`entity_registry:maintenance_changed` (`{source, kind: window|override, count, override_id?, …}` —
+`entity_registry:maintenance_changed` (`cluster=True`; `{source, kind: window|override, count, override_id?, …}` —
 **ein** Sammel-Event je verarbeitetem `maintenance:*`-Event, kein `entity_updated` pro Entität;
 UIs laden daraufhin neu).
 

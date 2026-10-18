@@ -22,7 +22,7 @@ instances. Roll out **before** orchestrator 1.6.0.
   informational — the entity's type stays authoritative),
   `maintenance:override_started` (upsert per `(entity, source, override_id)`),
   `maintenance:override_ended` (`ended_at` + `linger_minutes`; the first end wins).
-  One `entity_registry:maintenance_changed {source, kind, count, …}` per event
+  One `entity_registry:maintenance_changed {source, kind, count, …}` (cluster-wide) per event
   instead of an `entity_updated` per entity.
 - Field `maintenance` on `GET /entities/{uuid}` (full: `active`, `until`,
   `source`, `next_start`, `note`, `windows[]` per source with `inherited_from`,

@@ -876,7 +876,7 @@ class EntityRegistryService:
         self._emit(MAINTENANCE_CHANGED_TOPIC, {
             "source": source, "kind": "window", "count": stored,
             "skipped_unknown": unknown, "skipped_invalid": invalid,
-        })
+        }, cluster=True)
         return {"source": source, "count": stored, "skipped_unknown": unknown,
                 "skipped_invalid": invalid}
 
@@ -935,7 +935,7 @@ class EntityRegistryService:
         self._emit(MAINTENANCE_CHANGED_TOPIC, {
             "source": ov["source"], "kind": "override", "override_id": ov["override_id"],
             "count": stored, "skipped_unknown": unknown,
-        })
+        }, cluster=True)
         return {"override_id": ov["override_id"], "source": ov["source"], "count": stored,
                 "skipped_unknown": unknown}
 
@@ -994,7 +994,7 @@ class EntityRegistryService:
         self._emit(MAINTENANCE_CHANGED_TOPIC, {
             "source": ov["source"], "kind": "override", "override_id": ov["override_id"],
             "count": count, "ended": True,
-        })
+        }, cluster=True)
         return {"override_id": ov["override_id"], "count": count}
 
     def _end_override_tx(self, ov: dict) -> int:

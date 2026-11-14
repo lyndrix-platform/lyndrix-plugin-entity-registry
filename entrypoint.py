@@ -135,11 +135,20 @@ manifest = ModuleManifest(
             MAINTENANCE_CHANGED_TOPIC,
         ],
     },
+    # api:read / api:write are baseline grants of every viewer / user; the
+    # irreversible operations hang on this separate permission (INT_ADMIN only).
+    custom_permissions=[
+        {"id": "registry:admin", "label": "Entity Registry Administration",
+         "description": "Merge and retire entities, register entities with their own UUID, "
+                        "dismiss conflicts, reload the catalog, ingest under a chosen source",
+         "icon": "admin_panel_settings"},
+    ],
     roles=[
         {"id": "admin", "label": "Entity Registry Administrator",
-         "permissions": [f"plugin:{PLUGIN_ID}:api:read", f"plugin:{PLUGIN_ID}:api:write"],
+         "permissions": [f"plugin:{PLUGIN_ID}:api:read", f"plugin:{PLUGIN_ID}:api:write",
+                         f"plugin:{PLUGIN_ID}:registry:admin"],
          "auto_map_groups": ["INT_ADMIN"],
-         "description": "Identify/register entities, merge conflicts, manage relations."},
+         "description": "Register entities, merge/retire, resolve conflicts, reload the catalog."},
         {"id": "viewer", "label": "Entity Registry Viewer",
          "permissions": [f"plugin:{PLUGIN_ID}:api:read"],
          "auto_map_groups": [],

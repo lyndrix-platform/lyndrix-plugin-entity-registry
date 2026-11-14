@@ -112,6 +112,21 @@ function fmt(ts: string | null): string {
   return isNaN(d.getTime()) ? ts : d.toLocaleString()
 }
 
+// Merge / retire / dismiss need the registry:admin permission. The backend
+// enforces it; this only hides actions that would end in 403. A failing
+// lookup (older backend without /access) keeps the actions visible.
+let accessPromise: Promise<boolean> | null = null
+function useIsAdmin(): boolean {
+  const [admin, setAdmin] = useState(false)
+  useEffect(() => {
+    let alive = true
+    accessPromise ??= registryApi.getAccess().then((a) => a.admin).catch(() => true)
+    void accessPromise.then((a) => { if (alive) setAdmin(a) })
+    return () => { alive = false }
+  }, [])
+  return admin
+}
+
 function useCatalog() {
   const [catalog, setCatalog] = useState<Catalog | null>(null)
   useEffect(() => {
@@ -393,6 +408,7 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
   const [relTo, setRelTo] = useState('')
   const [relKind, setRelKind] = useState('')
   const [confirmRetire, setConfirmRetire] = useState(false)
+  const isAdmin = useIsAdmin()
   // ITSM records referencing this CI: undefined = loading, null = ITSM not available.
   const [itsm, setItsm] = useState<ItsmRecordSummary[] | null | undefined>(undefined)
 
@@ -549,7 +565,7 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
             </div>
           )}
 
-          <div className="lx-card" style={{ padding: '1rem' }}>
+          {isAdmin && <div className="lx-card" style={{ padding: '1rem' }}>
             <div className="lx-section-title">{t('detail.actions', { defaultValue: 'Actions' })}</div>
             <p style={{ fontSize: '0.78rem', color: 'var(--lx-text-muted)', margin: '0 0 0.5rem' }}>
               {t('detail.mergeHint', { defaultValue: 'Merge another entity into this one: its identifiers and relations move here and its UUID keeps resolving to this entity.' })}
@@ -571,7 +587,7 @@ function EntityDetail({ uuid, catalog, onBack, onOpen, onChanged }: {
                 </>
               )}
             </div>
-          </div>
+          </div>}
         </div>
       )}
     </>
@@ -586,6 +602,7 @@ function ConflictList({ catalog, onOpen, onBack, onChanged }: {
 }) {
   const { t } = useTranslation('entity_registry')
   const [conflicts, setConflicts] = useState<Conflict[]>([])
+  const isAdmin = useIsAdmin()
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -644,7 +661,7 @@ function ConflictList({ catalog, onOpen, onBack, onChanged }: {
             <TypeBadge type={c.entity_type} catalog={catalog} />
             <span style={{ fontSize: '0.75rem', color: 'var(--lx-text-muted)' }}>{t('conflicts.reportedBy', { defaultValue: 'reported by {{source}} · {{when}}', source: c.source ?? '?', when: fmt(c.created_at) })}</span>
             <span style={{ flex: 1 }} />
-            <Button label={t('conflicts.dismiss', { defaultValue: 'Dismiss' })} icon="close" disabled={busy} onClick={() => void dismiss(c)} />
+            {isAdmin && <Button label={t('conflicts.dismiss', { defaultValue: 'Dismiss' })} icon="close" disabled={busy} onClick={() => void dismiss(c)} />}
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem', marginBottom: '0.6rem' }}>
             {Object.entries(c.identifiers).map(([s, v]) => <IdentChip key={s} scheme={s} value={v} />)}
@@ -659,7 +676,7 @@ function ConflictList({ catalog, onOpen, onBack, onChanged }: {
                   </td>
                   <td style={{ fontSize: '0.75rem', color: 'var(--lx-text-muted)' }}>{t('conflicts.matched', { defaultValue: 'matched via' })} {cand.matched.join(', ')}</td>
                   <td style={{ textAlign: 'right' }}>
-                    <Button label={t('conflicts.keep', { defaultValue: 'Keep this, merge others' })} icon="call_merge" variant="primary" disabled={busy} onClick={() => void keep(c, cand.uuid)} />
+                    {isAdmin && <Button label={t('conflicts.keep', { defaultValue: 'Keep this, merge others' })} icon="call_merge" variant="primary" disabled={busy} onClick={() => void keep(c, cand.uuid)} />}
                   </td>
                 </tr>
               ))}

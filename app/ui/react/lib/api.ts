@@ -212,6 +212,8 @@ export const registryApi = {
     apiFetch<{ conflict: Conflict }>(base(`conflicts/${enc(id)}/dismiss`), {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
+  /** What the caller may do (0.3.1+): merge/retire/dismiss need `admin`. */
+  getAccess: () => apiFetch<{ write: boolean; admin: boolean; source: string }>(base('access')),
   getCatalog: () => apiFetch<Catalog>(base('catalog')),
   getStats: () => apiFetch<Stats>(base('stats')),
 }

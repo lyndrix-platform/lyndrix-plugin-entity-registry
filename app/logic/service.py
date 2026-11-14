@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import delete, func, or_, select, text, tuple_
+from sqlalchemy import delete, func, or_, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
@@ -48,6 +48,9 @@ MAINTENANCE_CHANGED_TOPIC = "entity_registry:maintenance_changed"
 # Expired overrides are purged this long after their effective end (no timer:
 # the sweep piggybacks on the next override event).
 PURGE_GRACE = timedelta(days=1)
+# identify_batch() reads the whole batch with ``IN`` lists of at most this many
+# entries per statement (a 500-host inventory chunk fits into one).
+BATCH_IN_CHUNK = 2000
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
@@ -480,6 +483,141 @@ class EntityRegistryService:
             events = [("entity_registry:conflict", {"conflict": conflict})] if conflict else []
             return {"uuid": winner_uuid, "created": False, "conflict": True,
                     "entity": detail}, events
+
+    # ── Batch reconciliation ─────────────────────────────────────────────────
+
+    def identify_batch(self, items: list[dict]) -> list[dict]:
+        """``identify()`` for many observations — the inventory-sync path.
+
+        Each item is ``{entity_type, identifiers, display_name?, attributes?,
+        source?}``; the result list has one entry per item, in order:
+        ``{ok: True, uuid, created, conflict}`` or ``{ok: False, error,
+        identifiers}``. Items are independent — one failure never fails the rest.
+
+        A periodic sync re-reports hundreds of hosts that have not changed, and
+        the caller waits for the reply with a timeout. So the batch is read with
+        set-based queries (a constant number of statements, not ~7 per item) and
+        every observation that would change nothing is answered straight from
+        that snapshot; stale ``last_seen_at`` values are refreshed in one
+        ``UPDATE``. Only new, changed, mismatching or conflicting observations
+        take the full ``identify()`` transaction (and emit its events).
+        """
+        self._require_ready()
+        results: list[dict | None] = [None] * len(items)
+        prepared: dict[int, tuple[str, dict[str, str], str | None, dict | None, str | None]] = {}
+        for i, item in enumerate(items):
+            try:
+                if not isinstance(item, dict):
+                    raise RegistryError("item must be an object")
+                entity_type = self._check_type(str(item.get("entity_type") or ""))
+                idents = _norm_identifiers(item.get("identifiers"))
+                if not idents:
+                    raise RegistryError("At least one identifier is required")
+                self._check_schemes(idents)
+                prepared[i] = (
+                    entity_type, idents, item.get("display_name"), item.get("attributes"),
+                    (str(item.get("source") or "")).strip() or None,
+                )
+            except RegistryError as exc:
+                results[i] = self._batch_error(item, exc)
+
+        try:
+            unchanged, stale = self._batch_snapshot(prepared)
+        except Exception as exc:
+            # The fast path is an optimisation; the per-item path below still
+            # reports its own errors.
+            log.warning(f"EntityRegistry: identify_batch snapshot failed, using slow path — {exc}")
+            unchanged, stale = {}, []
+        for i, uuid in unchanged.items():
+            results[i] = {"ok": True, "uuid": uuid, "created": False, "conflict": False}
+        if stale:
+            try:
+                self._write(lambda: self._touch_last_seen(stale), what="identify_batch")
+            except Exception as exc:  # freshness only — never fail the batch for it
+                log.debug(f"EntityRegistry: last_seen refresh skipped — {exc}")
+
+        for i, (entity_type, idents, display_name, attributes, source) in prepared.items():
+            if results[i] is not None:
+                continue
+            try:
+                res = self.identify(
+                    entity_type, idents,
+                    display_name=display_name, attributes=attributes, source=source,
+                )
+                results[i] = {"ok": True, "uuid": res["uuid"], "created": res["created"],
+                              "conflict": res["conflict"]}
+            except Exception as exc:  # RegistryError / DB — reported per item
+                results[i] = self._batch_error(items[i], exc)
+        return [r for r in results if r is not None]
+
+    @staticmethod
+    def _batch_error(item, exc: Exception) -> dict:
+        return {"ok": False, "error": str(exc),
+                "identifiers": item.get("identifiers") if isinstance(item, dict) else None}
+
+    def _batch_snapshot(self, prepared: dict) -> tuple[dict[int, str], list[str]]:
+        """Decide which batch items change nothing → ``({index: uuid}, uuids
+        whose last_seen_at is stale)``. Read-only; two ``IN`` queries per
+        ``BATCH_IN_CHUNK`` identifiers, independent of the item count."""
+        pairs = list(dict.fromkeys(
+            pair for _t, idents, *_rest in prepared.values() for pair in idents.items()
+        ))
+        if not pairs:
+            return {}, []
+        with get_session() as s:
+            owner: dict[tuple[str, str], str] = {}
+            for start in range(0, len(pairs), BATCH_IN_CHUNK):
+                chunk = pairs[start:start + BATCH_IN_CHUNK]
+                for scheme, value, entity_uuid in s.execute(
+                    select(Identifier.scheme, Identifier.value, Identifier.entity_uuid).where(
+                        tuple_(Identifier.scheme, Identifier.value).in_(chunk)
+                    )
+                ):
+                    owner[(scheme, value)] = entity_uuid
+            uuids = sorted(set(owner.values()))
+            entities: dict[str, Entity] = {}
+            for start in range(0, len(uuids), BATCH_IN_CHUNK):
+                for e in s.execute(
+                    select(Entity).where(Entity.uuid.in_(uuids[start:start + BATCH_IN_CHUNK]))
+                ).scalars():
+                    entities[e.uuid] = e
+
+            now = _now()
+            unchanged: dict[int, str] = {}
+            stale: dict[str, None] = {}
+            for i, (entity_type, idents, display_name, attributes, source) in prepared.items():
+                owners = {owner.get(pair) for pair in idents.items()}
+                if len(owners) != 1 or None in owners:
+                    continue  # new entity, new alias or a conflict → full identify()
+                entity = entities.get(next(iter(owners)))
+                # Tombstones (merge), a retired entity coming back, a type
+                # mismatch and every field change keep the full path's handling.
+                if entity is None or entity.status != "active" or entity.entity_type != entity_type:
+                    continue
+                name = (display_name or "").strip()
+                if name and name != entity.display_name:
+                    continue
+                current = entity.attributes or {}
+                if attributes and {**current, **attributes} != current:
+                    continue
+                if source and source not in (entity.sources or []):
+                    continue
+                unchanged[i] = entity.uuid
+                if entity.last_seen_at is None or now - entity.last_seen_at >= LAST_SEEN_RESOLUTION:
+                    stale[entity.uuid] = None
+            return unchanged, list(stale)
+
+    def _touch_last_seen(self, uuids: list[str]) -> None:
+        now = _now()
+        with get_session() as s:
+            for start in range(0, len(uuids), BATCH_IN_CHUNK):
+                s.execute(
+                    update(Entity)
+                    .where(Entity.uuid.in_(uuids[start:start + BATCH_IN_CHUNK]))
+                    .values(last_seen_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+            s.commit()
 
     def _create(self, s, entity_type, idents, *, display_name, attributes, source) -> Entity:
         entity = Entity(

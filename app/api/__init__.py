@@ -252,16 +252,11 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
         _ensure_ready()
         # Reject a spoofed source before anything is written (all-or-nothing).
         sources = [effective_source(identity, item.source) for item in payload.items]
-        results: List[Dict[str, Any]] = []
-        for item, source in zip(payload.items, sources):
-            try:
-                res = await asyncio.to_thread(
-                    service.identify, item.entity_type, item.identifiers,
-                    display_name=item.display_name, attributes=item.attributes, source=source,
-                )
-                results.append({"ok": True, **{k: res[k] for k in ("uuid", "created", "conflict")}})
-            except (RegistryError, NotFound) as exc:
-                results.append({"ok": False, "error": str(exc), "identifiers": item.identifiers})
+        # One worker thread and set-based reads for the whole batch.
+        results: List[Dict[str, Any]] = await _call(
+            service.identify_batch,
+            [{**item.model_dump(), "source": source} for item, source in zip(payload.items, sources)],
+        )
         return {
             "results": results,
             "created": sum(1 for r in results if r.get("created")),

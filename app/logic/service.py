@@ -889,6 +889,8 @@ class EntityRegistryService:
                 rel.from_uuid, rel.to_uuid = new_from, new_to
                 existing_rel.add(key)
 
+            self._merge_maintenance(s, keep_uuid, drop_uuid)
+
             keep.attributes = {**(drop.attributes or {}), **(keep.attributes or {})}
             keep.sources = list(dict.fromkeys([*(keep.sources or []), *(drop.sources or [])]))
             if drop.status == "active" and keep.status == "retired":
@@ -909,6 +911,41 @@ class EntityRegistryService:
             s.commit()
             s.refresh(keep)
             return self._entity_detail(s, keep)
+
+    @staticmethod
+    def _merge_maintenance(s, keep_uuid: str, drop_uuid: str) -> None:
+        """Re-point the dropped entity's maintenance rows to the survivor.
+
+        Windows would come back with the source's next publish, but overrides
+        are never republished — without this a deploy override running on the
+        dropped CI is lost and the CI shows "not in maintenance" mid-deploy.
+        On a key clash (same source/kind/override_id on both): the survivor's
+        window set wins; for an override — the same override seen on both CIs —
+        the later ``until`` and the earliest known end are kept.
+        """
+        mine = {
+            (r.source, r.kind, r.override_id): r
+            for r in s.execute(
+                select(MaintenanceEntry).where(MaintenanceEntry.entity_uuid == keep_uuid)
+            ).scalars()
+        }
+        for row in s.execute(
+            select(MaintenanceEntry).where(MaintenanceEntry.entity_uuid == drop_uuid)
+        ).scalars().all():
+            existing = mine.get((row.source, row.kind, row.override_id))
+            if existing is None:
+                row.entity_uuid = keep_uuid
+                continue
+            if row.kind == "override":
+                if row.until is not None and (existing.until is None or row.until > existing.until):
+                    existing.until = row.until
+                ends = [e for e in (existing.ended_at, row.ended_at) if e is not None]
+                if ends and existing.ended_at != min(ends):
+                    existing.ended_at = min(ends)
+                    existing.linger_minutes = (
+                        row.linger_minutes if row.ended_at == min(ends) else existing.linger_minutes
+                    )
+            s.delete(row)
 
     # ── Relations ────────────────────────────────────────────────────────────
 

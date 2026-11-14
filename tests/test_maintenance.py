@@ -560,3 +560,48 @@ def test_bus_override_handlers_reject_bad_payloads(bus):
     _run(ended({"source": SRC}))
     _run(ended([]))
     assert len(_failed(bus)) == 5
+
+
+# ── Merge carries maintenance state (ER-03) ──────────────────────────────────
+
+
+def test_merge_carries_windows_and_running_overrides_of_the_dropped_entity(svc):
+    now = mwx.utcnow()
+    a, b = _host(svc, "a", "hydra/1"), _host(svc, "b", "hydra/2")
+    win = _once(now - timedelta(hours=1), now + timedelta(hours=1), "patching")
+    svc.apply_windows(SRC, [_item(b, win)])
+    svc.start_override(_started("job-m", [b], now))
+
+    svc.merge(a, b)
+
+    m = svc.get_entity(a)["maintenance"]
+    assert [w["source"] for w in m["windows"]] == [SRC] and m["windows"][0]["windows"]
+    assert [o["id"] for o in m["overrides"]] == ["job-m"] and m["active"] is True
+    # The old id keeps answering through the tombstone.
+    via_b = svc.get_maintenance([b])["maintenance"][b]
+    assert via_b["uuid"] == a and via_b["active"] is True
+    # ... and the override can still be ended.
+    assert svc.end_override({"override_id": "job-m", "source": SRC})["count"] == 1
+
+
+def test_merge_resolves_maintenance_key_clashes(svc):
+    from app.model.database import get_session
+    from app.model.models import MaintenanceEntry
+
+    now = mwx.utcnow()
+    a, b = _host(svc, "a", "hydra/1"), _host(svc, "b", "hydra/2")
+    keep_win = _once(now + timedelta(hours=1), now + timedelta(hours=2), "keep")
+    drop_win = _once(now + timedelta(hours=5), now + timedelta(hours=6), "drop")
+    svc.apply_windows(SRC, [_item(a, keep_win), _item(b, drop_win)])
+    # The same override on both CIs; the dropped one carries the later `until`.
+    svc.start_override(_started("job-x", [a], now, minutes=60))
+    svc.start_override(_started("job-x", [b], now, minutes=120))
+
+    svc.merge(a, b)
+
+    with get_session() as s:
+        rows = s.query(MaintenanceEntry).all()
+        assert {r.entity_uuid for r in rows} == {a} and len(rows) == 2
+    m = svc.get_entity(a)["maintenance"]
+    assert [w["note"] for w in m["windows"][0]["windows"]] == ["keep"]  # survivor's set wins
+    assert m["until"] == _iso(now + timedelta(minutes=120))

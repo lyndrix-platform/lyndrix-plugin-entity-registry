@@ -39,6 +39,7 @@ from ..model.models import (
     MaintenanceEntry,
     OverrideTombstone,
     Relation,
+    iso_z,
 )
 from . import maintenance as mwx
 from .catalog import CatalogLoader
@@ -137,7 +138,7 @@ class EntityRegistryService:
         tells the other cluster instances to reload theirs as well."""
         self.catalog.reload()
         if announce:
-            self._emit(CATALOG_RELOADED_TOPIC, {"reloaded_at": _now().isoformat()}, cluster=True)
+            self._emit(CATALOG_RELOADED_TOPIC, {"reloaded_at": iso_z(_now())}, cluster=True)
 
     # ── Validation ───────────────────────────────────────────────────────────
 

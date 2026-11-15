@@ -4,6 +4,29 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow the
 manifest `version` and the matching git tag.
 
+## [Unreleased]
+
+Proposed version: **0.4.0** (security audit 2026-11; the manifest version is not bumped yet). Minimum core unchanged.
+React bundle rebuild needed (admin actions follow `GET /access`). **Before the rollout:** only the admin role holds the
+new `registry:admin` permission.
+
+### Security
+- New custom permission `registry:admin` (admin role): merge, retire, register, dismissing a conflict, catalog reload
+  and choosing an ingest `source`. The `source` of REST `/identify` defaults to `user:<name>`. New `GET /access`
+  (ER-01).
+
+### Fixed
+- Batch identify is set-based: a constant number of statements for unchanged items; reply shapes are unchanged (ER-02).
+- A merge carries the maintenance windows and overrides of the dropped CI over to the surviving one (ER-03).
+- A `maintenance:override_ended` that arrives before its `override_started` is remembered (new table
+  `registry_maintenance_tombstones`) and the late start is stored as already ended; a re-delivered end never moves
+  `until` or the first end time (ER-04).
+- Two concurrent merges in opposite directions cannot create a tombstone cycle: entities are locked in uuid order and
+  the loser gets HTTP 409 (ER-05).
+
+### Changed
+- All API timestamps are ISO 8601 with `Z`; `created_at`/`updated_at` are written as Python UTC, not DB `NOW()` (ER-06).
+
 ## [0.3.0] - 2026-10-18
 
 Maintenance-window read-model (feature "maintenance windows", part P5a) and the

@@ -90,7 +90,7 @@ TOPIC_OVERRIDE_ENDED = "maintenance:override_ended"
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="Entity Registry",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Stable UUIDs for every configuration item. Reconciles identities across "
         "plugins (IaC, Server Manager, Monitoring, ITSM) so a renamed host keeps its id."

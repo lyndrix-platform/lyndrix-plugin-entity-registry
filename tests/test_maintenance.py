@@ -496,7 +496,7 @@ def test_manifest_declares_maintenance_topics(entrypoint):
         "maintenance:override_ended",
     } <= set(perms.subscribe)
     assert "entity_registry:maintenance_changed" in perms.emit
-    assert entrypoint.manifest.version == "0.3.0"
+    assert entrypoint.manifest.version == "0.4.0"
 
 
 def test_bus_windows_published_rejects_bad_payloads(bus, svc):

@@ -553,3 +553,37 @@ def test_bus_identify_batch_reply_shape_is_unchanged(bus, svc):
     assert set(ok) == {"ok", "uuid", "created", "conflict"} and ok["created"] is True
     assert bad["ok"] is False and bad["identifiers"] == {"iac.host": "a"}
     assert garbage == {"ok": False, "error": garbage["error"], "identifiers": None}
+
+
+# ── ER-05: opposite merges ────────────────────────────────────────────────────
+
+
+def test_opposite_merges_leave_exactly_one_winner(svc):
+    """B<-A commits while A<-B is mid-transaction: the second must lose (409),
+    never produce a tombstone cycle."""
+    import pytest
+    from app.logic.service import MergeConflict
+
+    a = svc.identify("host", {"iac.host": "a"}, source="t")["uuid"]
+    b = svc.identify("host", {"iac.host": "b"}, source="t")["uuid"]
+    real = svc._merge_maintenance
+    fired = []
+
+    def _opposite_first(s, keep, drop):
+        if not fired:
+            fired.append(1)
+            svc._merge_tx(drop, keep)  # the other admin's merge commits first
+        return real(s, keep, drop)
+
+    svc._merge_maintenance = _opposite_first
+    try:
+        with pytest.raises(MergeConflict):
+            svc._merge_tx(a, b)
+    finally:
+        del svc._merge_maintenance
+
+    assert svc.get_entity(b, follow_merge=False)["status"] == "active"
+    assert svc.get_entity(a, follow_merge=False)["status"] == "merged"
+    assert svc.get_entity(a)["uuid"] == b  # tombstone resolves, no cycle
+    assert svc.get_entity(b)["uuid"] == b
+

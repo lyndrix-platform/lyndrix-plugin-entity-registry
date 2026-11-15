@@ -126,3 +126,11 @@ def test_bus_identify_keeps_the_caller_named_source(bus, svc):
     assert reply["ok"] and reply["request_id"] == "r1" and set(reply) == {
         "request_id", "ok", "uuid", "created", "conflict"}
     assert svc.lookup("iac.host", "bus-1")["owner_source"] == "iac-orchestrator"
+
+
+def test_merging_an_already_merged_entity_is_409(client, svc):
+    """ER-05: the loser of a merge race gets 409, not a generic 400."""
+    a, b = _host(svc, "a"), _host(svc, "b")
+    client.as_(ADMIN)
+    assert client.post(f"/entities/{a}/merge", json={"drop_uuid": b}).status_code == 200
+    assert client.post(f"/entities/{b}/merge", json={"drop_uuid": a}).status_code == 409

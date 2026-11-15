@@ -66,6 +66,10 @@ class RegistryError(ValueError):
     """Invalid input (unknown type/scheme/relation, missing identifiers, ...)."""
 
 
+class MergeConflict(RegistryError):
+    """A concurrent merge involving one of the two entities won (HTTP 409)."""
+
+
 class NotFound(LookupError):
     pass
 
@@ -864,11 +868,20 @@ class EntityRegistryService:
 
     def _merge_tx(self, keep_uuid: str, drop_uuid: str) -> dict:
         with get_session() as s:
-            keep, drop = s.get(Entity, keep_uuid), s.get(Entity, drop_uuid)
+            # ER-05: lock both rows in a fixed (uuid) order so two opposite
+            # merges (A<-B and B<-A) serialise instead of both committing and
+            # leaving a tombstone cycle. The loser re-reads the winner's status.
+            locked = {
+                e.uuid: e for e in s.execute(
+                    select(Entity).where(Entity.uuid.in_([keep_uuid, drop_uuid]))
+                    .order_by(Entity.uuid).with_for_update()
+                ).scalars()
+            }
+            keep, drop = locked.get(keep_uuid), locked.get(drop_uuid)
             if keep is None or drop is None:
                 raise NotFound("Unknown entity uuid")
             if keep.status == "merged" or drop.status == "merged":
-                raise RegistryError("Cannot merge an already merged entity")
+                raise MergeConflict("Cannot merge an already merged entity")
 
             for ident in s.execute(
                 select(Identifier).where(Identifier.entity_uuid == drop_uuid)
@@ -905,8 +918,21 @@ class EntityRegistryService:
                 keep.status = "active"
             keep.last_seen_at = max(filter(None, [keep.last_seen_at, drop.last_seen_at, _now()]))
 
-            drop.status = "merged"
-            drop.merged_into = keep_uuid
+            # Conditional update as the second line of defence (no row locks,
+            # e.g. a core without FOR UPDATE support): only one merge may flip
+            # an entity to "merged"; the loser's whole transaction rolls back.
+            flipped = s.execute(
+                update(Entity)
+                .where(Entity.uuid == drop_uuid, Entity.status != "merged")
+                .values(status="merged", merged_into=keep_uuid)
+                .execution_options(synchronize_session=False)
+            ).rowcount
+            kept = s.execute(
+                select(Entity.status).where(Entity.uuid == keep_uuid)
+            ).scalar_one()
+            if not flipped or kept == "merged":
+                s.rollback()
+                raise MergeConflict("A concurrent merge changed one of the entities — reload and retry")
 
             # Any open conflict that involved the dropped entity is settled.
             for c in s.execute(select(Conflict).where(Conflict.status == "open")).scalars().all():

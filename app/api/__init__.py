@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from core.api import ApiIdentity, require_permission
 
-from ..logic.service import EntityRegistryService, NotFound, RegistryError
+from ..logic.service import EntityRegistryService, MergeConflict, NotFound, RegistryError
 
 PLUGIN_ID = "lyndrix.plugin.entity_registry"
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
@@ -130,6 +130,8 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
         """Run a service call off-loop and map domain errors to HTTP codes."""
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
+        except MergeConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RegistryError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except NotFound as exc:

@@ -13,6 +13,9 @@ MaintenanceEntry — read-model of the maintenance-window feature: one row per
               (entity, source) with the published windows, one row per
               (entity, source, override_id) for a running override. Evaluated
               at read time, never a source of truth (0.3.0).
+OverrideTombstone — an ``override_ended`` that arrived before its
+              ``override_started``; remembered for the linger period so the
+              late "started" does not activate the override.
 """
 from __future__ import annotations
 
@@ -226,3 +229,28 @@ class MaintenanceEntry(_Base):
             "reason": self.reason,
             "updated_at": iso(self.updated_at),
         }
+
+
+class OverrideTombstone(_Base):
+    """An ``override_ended`` for an override no row exists for (yet).
+
+    Bus events are handled as concurrent tasks, so a quick deploy's "ended"
+    can be committed before its "started" (also: re-delivery, an emitter on
+    another instance). The tombstone carries the end time until
+    ``expires_at`` (= ``ended_at`` + linger); a "started" for the same
+    ``(source, override_id)`` arriving in that time is stored already ended.
+    ``source`` is ``""`` when the "ended" named no source (matches any).
+    """
+
+    __tablename__ = "registry_maintenance_tombstones"
+    __table_args__ = (
+        UniqueConstraint("source", "override_id", name="uq_registry_maintenance_tombstone"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String(64), nullable=False, default="")
+    override_id = Column(String(64), nullable=False)
+    ended_at = Column(DateTime, nullable=False)
+    linger_minutes = Column(Integer, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=func.now())

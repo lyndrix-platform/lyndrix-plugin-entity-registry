@@ -90,7 +90,7 @@ TOPIC_OVERRIDE_ENDED = "maintenance:override_ended"
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="Entity Registry",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Stable UUIDs for every configuration item. Reconciles identities across "
         "plugins (IaC, Server Manager, Monitoring, ITSM) so a renamed host keeps its id."
@@ -135,11 +135,20 @@ manifest = ModuleManifest(
             MAINTENANCE_CHANGED_TOPIC,
         ],
     },
+    # api:read / api:write are baseline grants of every viewer / user; the
+    # irreversible operations hang on this separate permission (INT_ADMIN only).
+    custom_permissions=[
+        {"id": "registry:admin", "label": "Entity Registry Administration",
+         "description": "Merge and retire entities, register entities with their own UUID, "
+                        "dismiss conflicts, reload the catalog, ingest under a chosen source",
+         "icon": "admin_panel_settings"},
+    ],
     roles=[
         {"id": "admin", "label": "Entity Registry Administrator",
-         "permissions": [f"plugin:{PLUGIN_ID}:api:read", f"plugin:{PLUGIN_ID}:api:write"],
+         "permissions": [f"plugin:{PLUGIN_ID}:api:read", f"plugin:{PLUGIN_ID}:api:write",
+                         f"plugin:{PLUGIN_ID}:registry:admin"],
          "auto_map_groups": ["INT_ADMIN"],
-         "description": "Identify/register entities, merge conflicts, manage relations."},
+         "description": "Register entities, merge/retire, resolve conflicts, reload the catalog."},
         {"id": "viewer", "label": "Entity Registry Viewer",
          "permissions": [f"plugin:{PLUGIN_ID}:api:read"],
          "auto_map_groups": [],
@@ -216,6 +225,25 @@ def setup(ctx):
         return {"ok": True, "uuid": res["uuid"], "created": res["created"],
                 "conflict": res["conflict"]}
 
+    def _identify_many(raw_items: list) -> list[dict]:
+        """Validate every item, then hand the valid ones to the set-based batch
+        path in one go (one worker thread for the whole batch; the reply keeps
+        one result per item, in order)."""
+        results: list = [None] * len(raw_items)
+        valid: list[dict] = []
+        positions: list[int] = []
+        for pos, raw in enumerate(raw_items):
+            try:
+                valid.append(IdentifyPayload.model_validate(raw).model_dump())
+                positions.append(pos)
+            except Exception as exc:  # pydantic
+                results[pos] = {"ok": False, "error": str(exc),
+                                "identifiers": raw.get("identifiers")
+                                if isinstance(raw, dict) else None}
+        for pos, res in zip(positions, svc.identify_batch(valid)):
+            results[pos] = res
+        return results
+
     @ctx.subscribe("entity_registry:identify")
     async def _on_identify(payload):
         topic = "entity_registry:identify"
@@ -227,15 +255,11 @@ def setup(ctx):
         if not svc.is_ready:
             reply.update(ok=False, error="database not ready")
         elif isinstance(payload.get("items"), list):
-            results = []
-            for item in payload["items"]:
-                try:
-                    results.append(await asyncio.to_thread(_identify_one, item))
-                except Exception as exc:  # pydantic / RegistryError / DB
-                    results.append({"ok": False, "error": str(exc),
-                                    "identifiers": (item or {}).get("identifiers")
-                                    if isinstance(item, dict) else None})
-            reply.update(ok=True, results=results)
+            try:
+                results = await asyncio.to_thread(_identify_many, payload["items"])
+                reply.update(ok=True, results=results)
+            except Exception as exc:  # per-item errors are in results; this is the DB being gone
+                reply.update(ok=False, error=str(exc))
         else:
             try:
                 data = {k: v for k, v in payload.items() if k != "request_id"}

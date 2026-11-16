@@ -440,3 +440,150 @@ def test_health_probe_is_cheap_and_counts_open_conflicts(svc):
     svc.identify("host", {"pve.vm": "hydra/100"}, source=SRC)
     svc.identify("host", {"iac.host": "alpha", "pve.vm": "hydra/100"}, source=SRC)
     assert svc.health_probe() == {"open_conflicts": 1}
+
+
+# ── Batch identify (ER-02) ───────────────────────────────────────────────────
+
+def _count_statements(fn):
+    from sqlalchemy import event
+
+    from app.model import database
+
+    seen: list[str] = []
+
+    def _on_execute(conn, cursor, statement, parameters, context, executemany):
+        seen.append(statement)
+
+    engine = database.db_instance.engine
+    event.listen(engine, "before_cursor_execute", _on_execute)
+    try:
+        result = fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", _on_execute)
+    return result, seen
+
+
+def _batch_items(n: int) -> list[dict]:
+    return [
+        {"entity_type": "host", "identifiers": {"iac.host": f"h-{i}", "fqdn": f"h-{i}.lan"},
+         "display_name": f"h-{i}", "attributes": {"site": "a"}, "source": "iac-orchestrator"}
+        for i in range(n)
+    ]
+
+
+def test_identify_batch_statement_count_is_constant_for_unchanged_items(svc):
+    small, big = _batch_items(50), _batch_items(500)
+    first = svc.identify_batch(big)
+    assert all(r["ok"] and r["created"] for r in first)
+    svc._ctx.events.clear()
+
+    res_big, stmts_big = _count_statements(lambda: svc.identify_batch(big))
+    res_small, stmts_small = _count_statements(lambda: svc.identify_batch(small))
+    # Unchanged and fresh: one identifier query + one entity query, whatever the size.
+    assert len(stmts_big) == len(stmts_small) == 2, stmts_big[:5]
+    assert [r["uuid"] for r in res_big] == [r["uuid"] for r in first]
+    assert all(r == {"ok": True, "uuid": r["uuid"], "created": False, "conflict": False}
+               for r in res_big)
+    assert svc._ctx.events == []  # nothing changed → nothing announced
+
+    # Stale last_seen_at: one extra UPDATE for the whole batch, still constant.
+    from app.model.database import get_session
+    from app.model.models import Entity
+    from datetime import timedelta
+    with get_session() as s:
+        for e in s.query(Entity):
+            e.last_seen_at = e.last_seen_at - timedelta(minutes=5)
+        s.commit()
+    before = svc.get_entity(first[0]["uuid"])["last_seen_at"]
+    _res, stmts_stale = _count_statements(lambda: svc.identify_batch(big))
+    assert len(stmts_stale) == 3
+    assert svc.get_entity(first[0]["uuid"])["last_seen_at"] > before
+
+
+def test_identify_batch_matches_identify_for_changed_new_and_broken_items(svc):
+    a = svc.identify("host", {"iac.host": "a"}, display_name="a", source="iac")["uuid"]
+    b = svc.identify("host", {"iac.host": "b"}, source="iac")["uuid"]
+    c = svc.identify("host", {"fqdn": "c.lan"}, source="iac")["uuid"]
+    svc.retire(b)
+    svc._ctx.events.clear()
+    res = svc.identify_batch([
+        {"entity_type": "host", "identifiers": {"iac.host": "a"}, "display_name": "renamed", "source": "iac"},
+        {"entity_type": "host", "identifiers": {"iac.host": "b"}, "source": "iac"},           # retired → back
+        {"entity_type": "host", "identifiers": {"iac.host": "new"}, "source": "iac"},         # new
+        {"entity_type": "nope", "identifiers": {"iac.host": "x"}, "source": "iac"},           # invalid
+        {"entity_type": "host", "identifiers": {"iac.host": "a", "fqdn": "c.lan"}, "source": "iac"},  # conflict
+        {"entity_type": "host", "identifiers": {"iac.host": "a"}, "source": "other"},         # new source
+        {"entity_type": "host", "identifiers": {}, "source": "iac"},
+    ])
+    assert [r["ok"] for r in res] == [True, True, True, False, True, True, False]
+    assert res[0]["uuid"] == a and svc.get_entity(a)["display_name"] == "renamed"
+    assert res[1]["uuid"] == b and svc.get_entity(b)["status"] == "active"
+    assert res[2]["created"] is True
+    assert "Unknown entity_type" in res[3]["error"] and res[3]["identifiers"] == {"iac.host": "x"}
+    assert res[4]["conflict"] is True and res[4]["uuid"] in (a, c)
+    assert "other" in svc.get_entity(a)["sources"]
+    topics = svc._ctx.topics()
+    assert topics.count("entity_registry:entity_created") == 1
+    assert "entity_registry:conflict" in topics
+
+
+def test_identify_batch_follows_merge_tombstone_via_full_path(svc):
+    a = svc.identify("host", {"iac.host": "a"}, source="iac")["uuid"]
+    b = svc.identify("host", {"fqdn": "b.lan"}, source="iac")["uuid"]
+    svc.merge(a, b)
+    res = svc.identify_batch([{"entity_type": "host", "identifiers": {"fqdn": "b.lan"}, "source": "iac"}])
+    assert res == [{"ok": True, "uuid": a, "created": False, "conflict": False}]
+
+
+def test_bus_identify_batch_reply_shape_is_unchanged(bus, svc):
+    import asyncio
+
+    asyncio.run(bus.handlers["entity_registry:identify"]({
+        "request_id": "r-9",
+        "items": [
+            {"entity_type": "host", "identifiers": {"iac.host": "a"}, "source": "iac"},
+            {"entity_type": "host", "identifiers": {"iac.host": "a"}},  # no source → invalid
+            "garbage",
+        ],
+    }))
+    topic, reply = bus.events[-1]
+    assert topic == "entity_registry:identified"
+    assert reply["request_id"] == "r-9" and reply["ok"] is True
+    ok, bad, garbage = reply["results"]
+    assert set(ok) == {"ok", "uuid", "created", "conflict"} and ok["created"] is True
+    assert bad["ok"] is False and bad["identifiers"] == {"iac.host": "a"}
+    assert garbage == {"ok": False, "error": garbage["error"], "identifiers": None}
+
+
+# ── ER-05: opposite merges ────────────────────────────────────────────────────
+
+
+def test_opposite_merges_leave_exactly_one_winner(svc):
+    """B<-A commits while A<-B is mid-transaction: the second must lose (409),
+    never produce a tombstone cycle."""
+    import pytest
+    from app.logic.service import MergeConflict
+
+    a = svc.identify("host", {"iac.host": "a"}, source="t")["uuid"]
+    b = svc.identify("host", {"iac.host": "b"}, source="t")["uuid"]
+    real = svc._merge_maintenance
+    fired = []
+
+    def _opposite_first(s, keep, drop):
+        if not fired:
+            fired.append(1)
+            svc._merge_tx(drop, keep)  # the other admin's merge commits first
+        return real(s, keep, drop)
+
+    svc._merge_maintenance = _opposite_first
+    try:
+        with pytest.raises(MergeConflict):
+            svc._merge_tx(a, b)
+    finally:
+        del svc._merge_maintenance
+
+    assert svc.get_entity(b, follow_merge=False)["status"] == "active"
+    assert svc.get_entity(a, follow_merge=False)["status"] == "merged"
+    assert svc.get_entity(a)["uuid"] == b  # tombstone resolves, no cycle
+    assert svc.get_entity(b)["uuid"] == b
+

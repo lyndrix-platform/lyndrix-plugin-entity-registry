@@ -86,6 +86,14 @@ lädt die Datei neu; ein ungültiger Katalog lässt die alte Version aktiv.
 Basis: `/api/plugins/lyndrix.plugin.entity_registry/` (authentifiziert; Rechte
 `plugin:lyndrix.plugin.entity_registry:api:read` bzw. `api:write`).
 
+`api:write` erhält im Core jeder normale Benutzer (`INT_USER`). Alles Unumkehrbare bzw.
+Betreiber-Relevante verlangt deshalb das eigene Recht
+`plugin:lyndrix.plugin.entity_registry:registry:admin` (Rolle `admin`, Gruppe `INT_ADMIN`):
+`/entities/{uuid}/merge`, `/entities/{uuid}/retire`, `/register`, `/conflicts/{id}/dismiss`,
+`/catalog/reload` sowie die freie Wahl von `source` bei `/identify` und `/identify/batch`.
+Ohne dieses Recht ist `source` optional und wird aus der Identität abgeleitet (`user:<name>`);
+ein abweichender Wert wird mit 403 abgelehnt. Die Bus-Schnittstelle ist davon unberührt.
+
 | Methode | Pfad | Zweck |
 |---|---|---|
 | `POST` | `/identify` | Find-or-create; Antwort `{uuid, created, conflict, entity}` |
@@ -105,6 +113,7 @@ Basis: `/api/plugins/lyndrix.plugin.entity_registry/` (authentifiziert; Rechte
 | `POST` | `/conflicts/{id}/dismiss` | Konflikt verwerfen („das sind wirklich zwei Dinge“) |
 | `GET` / `POST` | `/catalog` / `/catalog/reload` | Katalog lesen / neu laden |
 | `GET` | `/stats` | Zähler je Typ, Identifier, Beziehungen, offene Konflikte |
+| `GET` | `/access` | Was der Aufrufer darf: `{write, admin, source}` — die UI blendet damit Admin-Aktionen aus |
 
 ## Event-Bus
 
@@ -209,7 +218,7 @@ jeder Instanz; der gesamte Zustand liegt in der gemeinsamen MariaDB.
 
 | Rolle | Rechte | Auto-Mapping |
 |---|---|---|
-| `admin` | `api:read`, `api:write` | Gruppe `INT_ADMIN` |
+| `admin` | `api:read`, `api:write`, `registry:admin` | Gruppe `INT_ADMIN` |
 | `viewer` | `api:read` | — |
 
 ## React-UI

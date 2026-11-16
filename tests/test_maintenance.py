@@ -496,7 +496,7 @@ def test_manifest_declares_maintenance_topics(entrypoint):
         "maintenance:override_ended",
     } <= set(perms.subscribe)
     assert "entity_registry:maintenance_changed" in perms.emit
-    assert entrypoint.manifest.version == "0.3.0"
+    assert entrypoint.manifest.version == "0.4.0"
 
 
 def test_bus_windows_published_rejects_bad_payloads(bus, svc):
@@ -560,3 +560,124 @@ def test_bus_override_handlers_reject_bad_payloads(bus):
     _run(ended({"source": SRC}))
     _run(ended([]))
     assert len(_failed(bus)) == 5
+
+
+# ── Merge carries maintenance state (ER-03) ──────────────────────────────────
+
+
+def test_merge_carries_windows_and_running_overrides_of_the_dropped_entity(svc):
+    now = mwx.utcnow()
+    a, b = _host(svc, "a", "hydra/1"), _host(svc, "b", "hydra/2")
+    win = _once(now - timedelta(hours=1), now + timedelta(hours=1), "patching")
+    svc.apply_windows(SRC, [_item(b, win)])
+    svc.start_override(_started("job-m", [b], now))
+
+    svc.merge(a, b)
+
+    m = svc.get_entity(a)["maintenance"]
+    assert [w["source"] for w in m["windows"]] == [SRC] and m["windows"][0]["windows"]
+    assert [o["id"] for o in m["overrides"]] == ["job-m"] and m["active"] is True
+    # The old id keeps answering through the tombstone.
+    via_b = svc.get_maintenance([b])["maintenance"][b]
+    assert via_b["uuid"] == a and via_b["active"] is True
+    # ... and the override can still be ended.
+    assert svc.end_override({"override_id": "job-m", "source": SRC})["count"] == 1
+
+
+def test_merge_resolves_maintenance_key_clashes(svc):
+    from app.model.database import get_session
+    from app.model.models import MaintenanceEntry
+
+    now = mwx.utcnow()
+    a, b = _host(svc, "a", "hydra/1"), _host(svc, "b", "hydra/2")
+    keep_win = _once(now + timedelta(hours=1), now + timedelta(hours=2), "keep")
+    drop_win = _once(now + timedelta(hours=5), now + timedelta(hours=6), "drop")
+    svc.apply_windows(SRC, [_item(a, keep_win), _item(b, drop_win)])
+    # The same override on both CIs; the dropped one carries the later `until`.
+    svc.start_override(_started("job-x", [a], now, minutes=60))
+    svc.start_override(_started("job-x", [b], now, minutes=120))
+
+    svc.merge(a, b)
+
+    with get_session() as s:
+        rows = s.query(MaintenanceEntry).all()
+        assert {r.entity_uuid for r in rows} == {a} and len(rows) == 2
+    m = svc.get_entity(a)["maintenance"]
+    assert [w["note"] for w in m["windows"][0]["windows"]] == ["keep"]  # survivor's set wins
+    assert m["until"] == _iso(now + timedelta(minutes=120))
+
+
+# ── ER-04: out-of-order override events ───────────────────────────────────────
+
+
+def _state(svc, uuid, now):
+    from app.model.database import get_session
+
+    with get_session() as s:
+        return svc.maintenance_for(s, [uuid], now)[uuid]
+
+
+def test_override_ended_before_started_does_not_activate(svc):
+    now = mwx.utcnow()
+    a = _host(svc, "a", "hydra/1")
+    ended = now - timedelta(minutes=2)
+    end = {"override_id": "job-9", "source": SRC, "ended_at": _iso(ended), "linger_minutes": 15}
+    assert svc.end_override(end, now=now)["count"] == 0  # unknown id → remembered
+    # Re-delivered "ended" with another time: the first one stays.
+    svc.end_override({**end, "ended_at": _iso(now)}, now=now)
+
+    svc.start_override(_started("job-9", [a], now - timedelta(minutes=10)), now=now)
+    st = _state(svc, a, now)
+    # Same end state as in-order delivery: lingering until ended + 15 min, not until `until`.
+    assert st["active"] is True and st["until"] == _iso(ended + timedelta(minutes=15))
+    assert _state(svc, a, now + timedelta(minutes=14))["active"] is False
+
+    from app.model.database import get_session
+    from app.model.models import MaintenanceEntry
+    from sqlalchemy import select
+
+    with get_session() as s:
+        row = s.execute(select(MaintenanceEntry).where(MaintenanceEntry.override_id == "job-9")).scalar_one()
+        until_before = row.until
+    # No "ended" ever moves `until` or the first ended_at.
+    svc.end_override({**end, "ended_at": _iso(now + timedelta(minutes=30))}, now=now)
+    with get_session() as s:
+        row = s.execute(select(MaintenanceEntry).where(MaintenanceEntry.override_id == "job-9")).scalar_one()
+        assert row.until == until_before and row.ended_at == mwx.to_db(ended)
+
+
+def test_override_tombstone_expires_with_the_linger(svc):
+    now = mwx.utcnow()
+    a = _host(svc, "a", "hydra/1")
+    svc.end_override({"override_id": "job-10", "source": SRC, "ended_at": _iso(now), "linger_minutes": 15},
+                     now=now)
+    # Another emitter's override with the same id is not suppressed …
+    svc.start_override(_started("job-10", [a], now, source=MON), now=now)
+    assert _state(svc, a, now + timedelta(minutes=30))["active"] is True
+    # … and after the linger period the id counts as a new override.
+    later = now + timedelta(minutes=16)
+    svc.start_override(_started("job-10", [a], later), now=later)
+    st = _state(svc, a, later)
+    assert {o["source"] for o in st["overrides"]} == {SRC, MON}
+    assert st["until"] == _iso(later + timedelta(minutes=240))
+
+
+def test_sourceless_end_tombstone_matches_any_source_and_late_commit(svc):
+    """The "ended" commits its tombstone between the "started" read and commit:
+    the re-check after the commit closes the freshly stored rows."""
+    now = mwx.utcnow()
+    a = _host(svc, "a", "hydra/1")
+    real = svc._start_override_tx
+
+    def _ended_overtakes(ov, now_aware):
+        out = real(ov, now_aware)  # rows committed as active …
+        svc.end_override({"override_id": "job-11", "ended_at": _iso(now)}, now=now)
+        return out
+
+    svc._start_override_tx = _ended_overtakes
+    try:
+        svc.start_override(_started("job-11", [a], now), now=now)
+    finally:
+        del svc._start_override_tx
+    st = _state(svc, a, now + timedelta(minutes=16))
+    assert st["active"] is False

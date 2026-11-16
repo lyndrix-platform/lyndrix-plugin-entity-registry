@@ -26,13 +26,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import delete, func, or_, select, text, tuple_
+from sqlalchemy import delete, func, or_, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
 
 from ..model.database import ensure_tables, get_session, retry_write
-from ..model.models import Conflict, Entity, Identifier, MaintenanceEntry, Relation
+from ..model.models import (
+    Conflict,
+    Entity,
+    Identifier,
+    MaintenanceEntry,
+    OverrideTombstone,
+    Relation,
+    iso_z,
+)
 from . import maintenance as mwx
 from .catalog import CatalogLoader
 
@@ -48,11 +56,18 @@ MAINTENANCE_CHANGED_TOPIC = "entity_registry:maintenance_changed"
 # Expired overrides are purged this long after their effective end (no timer:
 # the sweep piggybacks on the next override event).
 PURGE_GRACE = timedelta(days=1)
+# identify_batch() reads the whole batch with ``IN`` lists of at most this many
+# entries per statement (a 500-host inventory chunk fits into one).
+BATCH_IN_CHUNK = 2000
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
 class RegistryError(ValueError):
     """Invalid input (unknown type/scheme/relation, missing identifiers, ...)."""
+
+
+class MergeConflict(RegistryError):
+    """A concurrent merge involving one of the two entities won (HTTP 409)."""
 
 
 class NotFound(LookupError):
@@ -127,7 +142,7 @@ class EntityRegistryService:
         tells the other cluster instances to reload theirs as well."""
         self.catalog.reload()
         if announce:
-            self._emit(CATALOG_RELOADED_TOPIC, {"reloaded_at": _now().isoformat()}, cluster=True)
+            self._emit(CATALOG_RELOADED_TOPIC, {"reloaded_at": iso_z(_now())}, cluster=True)
 
     # ── Validation ───────────────────────────────────────────────────────────
 
@@ -481,6 +496,141 @@ class EntityRegistryService:
             return {"uuid": winner_uuid, "created": False, "conflict": True,
                     "entity": detail}, events
 
+    # ── Batch reconciliation ─────────────────────────────────────────────────
+
+    def identify_batch(self, items: list[dict]) -> list[dict]:
+        """``identify()`` for many observations — the inventory-sync path.
+
+        Each item is ``{entity_type, identifiers, display_name?, attributes?,
+        source?}``; the result list has one entry per item, in order:
+        ``{ok: True, uuid, created, conflict}`` or ``{ok: False, error,
+        identifiers}``. Items are independent — one failure never fails the rest.
+
+        A periodic sync re-reports hundreds of hosts that have not changed, and
+        the caller waits for the reply with a timeout. So the batch is read with
+        set-based queries (a constant number of statements, not ~7 per item) and
+        every observation that would change nothing is answered straight from
+        that snapshot; stale ``last_seen_at`` values are refreshed in one
+        ``UPDATE``. Only new, changed, mismatching or conflicting observations
+        take the full ``identify()`` transaction (and emit its events).
+        """
+        self._require_ready()
+        results: list[dict | None] = [None] * len(items)
+        prepared: dict[int, tuple[str, dict[str, str], str | None, dict | None, str | None]] = {}
+        for i, item in enumerate(items):
+            try:
+                if not isinstance(item, dict):
+                    raise RegistryError("item must be an object")
+                entity_type = self._check_type(str(item.get("entity_type") or ""))
+                idents = _norm_identifiers(item.get("identifiers"))
+                if not idents:
+                    raise RegistryError("At least one identifier is required")
+                self._check_schemes(idents)
+                prepared[i] = (
+                    entity_type, idents, item.get("display_name"), item.get("attributes"),
+                    (str(item.get("source") or "")).strip() or None,
+                )
+            except RegistryError as exc:
+                results[i] = self._batch_error(item, exc)
+
+        try:
+            unchanged, stale = self._batch_snapshot(prepared)
+        except Exception as exc:
+            # The fast path is an optimisation; the per-item path below still
+            # reports its own errors.
+            log.warning(f"EntityRegistry: identify_batch snapshot failed, using slow path — {exc}")
+            unchanged, stale = {}, []
+        for i, uuid in unchanged.items():
+            results[i] = {"ok": True, "uuid": uuid, "created": False, "conflict": False}
+        if stale:
+            try:
+                self._write(lambda: self._touch_last_seen(stale), what="identify_batch")
+            except Exception as exc:  # freshness only — never fail the batch for it
+                log.debug(f"EntityRegistry: last_seen refresh skipped — {exc}")
+
+        for i, (entity_type, idents, display_name, attributes, source) in prepared.items():
+            if results[i] is not None:
+                continue
+            try:
+                res = self.identify(
+                    entity_type, idents,
+                    display_name=display_name, attributes=attributes, source=source,
+                )
+                results[i] = {"ok": True, "uuid": res["uuid"], "created": res["created"],
+                              "conflict": res["conflict"]}
+            except Exception as exc:  # RegistryError / DB — reported per item
+                results[i] = self._batch_error(items[i], exc)
+        return [r for r in results if r is not None]
+
+    @staticmethod
+    def _batch_error(item, exc: Exception) -> dict:
+        return {"ok": False, "error": str(exc),
+                "identifiers": item.get("identifiers") if isinstance(item, dict) else None}
+
+    def _batch_snapshot(self, prepared: dict) -> tuple[dict[int, str], list[str]]:
+        """Decide which batch items change nothing → ``({index: uuid}, uuids
+        whose last_seen_at is stale)``. Read-only; two ``IN`` queries per
+        ``BATCH_IN_CHUNK`` identifiers, independent of the item count."""
+        pairs = list(dict.fromkeys(
+            pair for _t, idents, *_rest in prepared.values() for pair in idents.items()
+        ))
+        if not pairs:
+            return {}, []
+        with get_session() as s:
+            owner: dict[tuple[str, str], str] = {}
+            for start in range(0, len(pairs), BATCH_IN_CHUNK):
+                chunk = pairs[start:start + BATCH_IN_CHUNK]
+                for scheme, value, entity_uuid in s.execute(
+                    select(Identifier.scheme, Identifier.value, Identifier.entity_uuid).where(
+                        tuple_(Identifier.scheme, Identifier.value).in_(chunk)
+                    )
+                ):
+                    owner[(scheme, value)] = entity_uuid
+            uuids = sorted(set(owner.values()))
+            entities: dict[str, Entity] = {}
+            for start in range(0, len(uuids), BATCH_IN_CHUNK):
+                for e in s.execute(
+                    select(Entity).where(Entity.uuid.in_(uuids[start:start + BATCH_IN_CHUNK]))
+                ).scalars():
+                    entities[e.uuid] = e
+
+            now = _now()
+            unchanged: dict[int, str] = {}
+            stale: dict[str, None] = {}
+            for i, (entity_type, idents, display_name, attributes, source) in prepared.items():
+                owners = {owner.get(pair) for pair in idents.items()}
+                if len(owners) != 1 or None in owners:
+                    continue  # new entity, new alias or a conflict → full identify()
+                entity = entities.get(next(iter(owners)))
+                # Tombstones (merge), a retired entity coming back, a type
+                # mismatch and every field change keep the full path's handling.
+                if entity is None or entity.status != "active" or entity.entity_type != entity_type:
+                    continue
+                name = (display_name or "").strip()
+                if name and name != entity.display_name:
+                    continue
+                current = entity.attributes or {}
+                if attributes and {**current, **attributes} != current:
+                    continue
+                if source and source not in (entity.sources or []):
+                    continue
+                unchanged[i] = entity.uuid
+                if entity.last_seen_at is None or now - entity.last_seen_at >= LAST_SEEN_RESOLUTION:
+                    stale[entity.uuid] = None
+            return unchanged, list(stale)
+
+    def _touch_last_seen(self, uuids: list[str]) -> None:
+        now = _now()
+        with get_session() as s:
+            for start in range(0, len(uuids), BATCH_IN_CHUNK):
+                s.execute(
+                    update(Entity)
+                    .where(Entity.uuid.in_(uuids[start:start + BATCH_IN_CHUNK]))
+                    .values(last_seen_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+            s.commit()
+
     def _create(self, s, entity_type, idents, *, display_name, attributes, source) -> Entity:
         entity = Entity(
             uuid=str(uuid4()),
@@ -718,11 +868,20 @@ class EntityRegistryService:
 
     def _merge_tx(self, keep_uuid: str, drop_uuid: str) -> dict:
         with get_session() as s:
-            keep, drop = s.get(Entity, keep_uuid), s.get(Entity, drop_uuid)
+            # ER-05: lock both rows in a fixed (uuid) order so two opposite
+            # merges (A<-B and B<-A) serialise instead of both committing and
+            # leaving a tombstone cycle. The loser re-reads the winner's status.
+            locked = {
+                e.uuid: e for e in s.execute(
+                    select(Entity).where(Entity.uuid.in_([keep_uuid, drop_uuid]))
+                    .order_by(Entity.uuid).with_for_update()
+                ).scalars()
+            }
+            keep, drop = locked.get(keep_uuid), locked.get(drop_uuid)
             if keep is None or drop is None:
                 raise NotFound("Unknown entity uuid")
             if keep.status == "merged" or drop.status == "merged":
-                raise RegistryError("Cannot merge an already merged entity")
+                raise MergeConflict("Cannot merge an already merged entity")
 
             for ident in s.execute(
                 select(Identifier).where(Identifier.entity_uuid == drop_uuid)
@@ -751,14 +910,29 @@ class EntityRegistryService:
                 rel.from_uuid, rel.to_uuid = new_from, new_to
                 existing_rel.add(key)
 
+            self._merge_maintenance(s, keep_uuid, drop_uuid)
+
             keep.attributes = {**(drop.attributes or {}), **(keep.attributes or {})}
             keep.sources = list(dict.fromkeys([*(keep.sources or []), *(drop.sources or [])]))
             if drop.status == "active" and keep.status == "retired":
                 keep.status = "active"
             keep.last_seen_at = max(filter(None, [keep.last_seen_at, drop.last_seen_at, _now()]))
 
-            drop.status = "merged"
-            drop.merged_into = keep_uuid
+            # Conditional update as the second line of defence (no row locks,
+            # e.g. a core without FOR UPDATE support): only one merge may flip
+            # an entity to "merged"; the loser's whole transaction rolls back.
+            flipped = s.execute(
+                update(Entity)
+                .where(Entity.uuid == drop_uuid, Entity.status != "merged")
+                .values(status="merged", merged_into=keep_uuid)
+                .execution_options(synchronize_session=False)
+            ).rowcount
+            kept = s.execute(
+                select(Entity.status).where(Entity.uuid == keep_uuid)
+            ).scalar_one()
+            if not flipped or kept == "merged":
+                s.rollback()
+                raise MergeConflict("A concurrent merge changed one of the entities — reload and retry")
 
             # Any open conflict that involved the dropped entity is settled.
             for c in s.execute(select(Conflict).where(Conflict.status == "open")).scalars().all():
@@ -771,6 +945,41 @@ class EntityRegistryService:
             s.commit()
             s.refresh(keep)
             return self._entity_detail(s, keep)
+
+    @staticmethod
+    def _merge_maintenance(s, keep_uuid: str, drop_uuid: str) -> None:
+        """Re-point the dropped entity's maintenance rows to the survivor.
+
+        Windows would come back with the source's next publish, but overrides
+        are never republished — without this a deploy override running on the
+        dropped CI is lost and the CI shows "not in maintenance" mid-deploy.
+        On a key clash (same source/kind/override_id on both): the survivor's
+        window set wins; for an override — the same override seen on both CIs —
+        the later ``until`` and the earliest known end are kept.
+        """
+        mine = {
+            (r.source, r.kind, r.override_id): r
+            for r in s.execute(
+                select(MaintenanceEntry).where(MaintenanceEntry.entity_uuid == keep_uuid)
+            ).scalars()
+        }
+        for row in s.execute(
+            select(MaintenanceEntry).where(MaintenanceEntry.entity_uuid == drop_uuid)
+        ).scalars().all():
+            existing = mine.get((row.source, row.kind, row.override_id))
+            if existing is None:
+                row.entity_uuid = keep_uuid
+                continue
+            if row.kind == "override":
+                if row.until is not None and (existing.until is None or row.until > existing.until):
+                    existing.until = row.until
+                ends = [e for e in (existing.ended_at, row.ended_at) if e is not None]
+                if ends and existing.ended_at != min(ends):
+                    existing.ended_at = min(ends)
+                    existing.linger_minutes = (
+                        row.linger_minutes if row.ended_at == min(ends) else existing.linger_minutes
+                    )
+            s.delete(row)
 
     # ── Relations ────────────────────────────────────────────────────────────
 
@@ -922,15 +1131,37 @@ class EntityRegistryService:
             s.commit()
             return len(by_uuid), unknown
 
-    def start_override(self, payload: dict) -> dict:
+    # Out-of-order contract (shared with the other maintenance consumers):
+    #   1. An override is identified by (source, override_id).
+    #   2. An "ended" for an override without stored rows is remembered as a
+    #      tombstone (its ended_at, kept until ended_at + linger).
+    #   3. A "started" arriving while the tombstone lives is stored already
+    #      ended with the tombstone's ended_at — the end state equals in-order
+    #      delivery. After the tombstone expired it is a new override.
+    #   4. A re-delivered "ended" is a no-op: the first ended_at wins and no
+    #      "ended" ever touches `until`.
+    #   5. A re-delivered "started" never revives an ended override.
+
+    def start_override(self, payload: dict, *, now: datetime | None = None) -> dict:
         """Upsert one override row per ``(entity, source, override_id)`` for
-        every known ``ci_id`` (``maintenance:override_started``)."""
+        every known ``ci_id`` (``maintenance:override_started``). ``now`` is
+        the processing time (tests inject it)."""
         self._require_ready()
         try:
             ov = mwx.parse_override_started(payload)
         except mwx.MaintenancePayloadError as exc:
             raise RegistryError(str(exc)) from exc
-        stored, unknown = self._write(lambda: self._start_override_tx(ov), what="start_override")
+        now = now or mwx.utcnow()
+        stored, unknown = self._write(
+            lambda: self._start_override_tx(ov, now), what="start_override"
+        )
+        # The "ended" may have committed its tombstone between our read and
+        # our commit (both handlers run as concurrent tasks). Each side
+        # re-checks after its own commit, so at least one sees the other.
+        self._write(
+            lambda: self._apply_tombstone_tx(ov["source"], ov["override_id"], now),
+            what="start_override",
+        )
         self._purge_quietly()
         self._emit(MAINTENANCE_CHANGED_TOPIC, {
             "source": ov["source"], "kind": "override", "override_id": ov["override_id"],
@@ -939,7 +1170,40 @@ class EntityRegistryService:
         return {"override_id": ov["override_id"], "source": ov["source"], "count": stored,
                 "skipped_unknown": unknown}
 
-    def _start_override_tx(self, ov: dict) -> tuple[int, int]:
+    @staticmethod
+    def _live_tombstone(s, source: str | None, override_id: str, now: datetime):
+        """The unexpired tombstone for this override, if any. A tombstone
+        written by a source-less "ended" (``source == ""``) matches any source."""
+        stmt = select(OverrideTombstone).where(
+            OverrideTombstone.override_id == override_id,
+            OverrideTombstone.expires_at > mwx.to_db(now),
+        )
+        if source is not None:
+            stmt = stmt.where(OverrideTombstone.source.in_(sorted({source, ""})))
+        return s.execute(stmt.order_by(OverrideTombstone.ended_at)).scalars().first()
+
+    def _apply_tombstone_tx(self, source: str, override_id: str, now: datetime) -> int:
+        """End every still-open row of an override a live tombstone exists for."""
+        with get_session() as s:
+            tomb = self._live_tombstone(s, source, override_id, now)
+            if tomb is None:
+                return 0
+            stmt = select(MaintenanceEntry).where(
+                MaintenanceEntry.kind == "override",
+                MaintenanceEntry.override_id == override_id,
+                MaintenanceEntry.ended_at.is_(None),
+            )
+            if tomb.source:
+                stmt = stmt.where(MaintenanceEntry.source == tomb.source)
+            rows = s.execute(stmt).scalars().all()
+            for row in rows:
+                row.ended_at = tomb.ended_at
+                row.linger_minutes = tomb.linger_minutes
+                row.updated_at = _now()
+            s.commit()
+            return len(rows)
+
+    def _start_override_tx(self, ov: dict, now_aware: datetime) -> tuple[int, int]:
         with get_session() as s:
             targets: dict[str, None] = {}
             unknown = 0
@@ -962,9 +1226,28 @@ class EntityRegistryService:
                         )
                     ).scalars()
                 }
+            # Already over? Either the "ended" overtook us (tombstone) or this
+            # is a re-delivery naming CIs the first "started" did not have —
+            # new rows are then born ended instead of becoming active.
+            ended_at, ended_linger = None, None
+            tomb = self._live_tombstone(s, ov["source"], ov["override_id"], now_aware)
+            if tomb is not None:
+                ended_at, ended_linger = tomb.ended_at, tomb.linger_minutes
+            else:
+                done = s.execute(
+                    select(MaintenanceEntry).where(
+                        MaintenanceEntry.kind == "override",
+                        MaintenanceEntry.source == ov["source"],
+                        MaintenanceEntry.override_id == ov["override_id"],
+                        MaintenanceEntry.ended_at.is_not(None),
+                    ).order_by(MaintenanceEntry.ended_at)
+                ).scalars().first()
+                if done is not None:
+                    ended_at, ended_linger = done.ended_at, done.linger_minutes
             now = _now()
             for uuid in targets:
                 row = rows.get(uuid)
+                is_new = row is None
                 if row is None:
                     row = MaintenanceEntry(
                         entity_uuid=uuid, kind="override", source=ov["source"],
@@ -973,23 +1256,37 @@ class EntityRegistryService:
                     s.add(row)
                 row.until = mwx.to_db(ov["until"])
                 row.started_at = mwx.to_db(ov["started_at"])
-                row.linger_minutes = ov["linger_minutes"]
                 row.reason = ov["reason"] or None
-                # ended_at is left alone: a re-delivered "started" after the
-                # "ended" was processed must not revive the override.
+                # ended_at of an existing row is left alone: a re-delivered
+                # "started" after the "ended" must not revive the override —
+                # and must not change the linger the "ended" fixed.
+                if row.ended_at is None:
+                    row.linger_minutes = ov["linger_minutes"]
+                    if ended_at is not None and (is_new or tomb is not None):
+                        row.ended_at = ended_at
+                        row.linger_minutes = ended_linger
                 row.updated_at = now
             s.commit()
             return len(targets), unknown
 
-    def end_override(self, payload: dict) -> dict:
+    def end_override(self, payload: dict, *, now: datetime | None = None) -> dict:
         """Mark every row of an override as ended (``maintenance:override_ended``);
-        it keeps counting as active for ``linger_minutes`` and expires by itself."""
+        it keeps counting as active for ``linger_minutes`` and expires by itself.
+        ``now`` is the processing time (tests inject it)."""
         self._require_ready()
         try:
             ov = mwx.parse_override_ended(payload)
         except mwx.MaintenancePayloadError as exc:
             raise RegistryError(str(exc)) from exc
-        count = self._write(lambda: self._end_override_tx(ov), what="end_override")
+        now = now or mwx.utcnow()
+        count = self._write(lambda: self._end_override_tx(ov, now), what="end_override")
+        if not count:
+            # No rows: a tombstone was written (or already existed). The
+            # "started" may have committed meanwhile — close its rows now.
+            count = self._write(
+                lambda: self._apply_tombstone_tx(ov["source"], ov["override_id"], now),
+                what="end_override",
+            )
         self._purge_quietly()
         self._emit(MAINTENANCE_CHANGED_TOPIC, {
             "source": ov["source"], "kind": "override", "override_id": ov["override_id"],
@@ -997,7 +1294,7 @@ class EntityRegistryService:
         }, cluster=True)
         return {"override_id": ov["override_id"], "count": count}
 
-    def _end_override_tx(self, ov: dict) -> int:
+    def _end_override_tx(self, ov: dict, now_aware: datetime) -> int:
         with get_session() as s:
             stmt = select(MaintenanceEntry).where(
                 MaintenanceEntry.kind == "override",
@@ -1007,11 +1304,38 @@ class EntityRegistryService:
                 stmt = stmt.where(MaintenanceEntry.source == ov["source"])
             rows = s.execute(stmt).scalars().all()
             now = _now()
+            linger = ov["linger_minutes"]
+            if not rows:
+                # Unknown override: the "started" has not been processed yet
+                # (or named only unknown CIs). Remember the end for the linger
+                # period; the first tombstone wins on re-delivery. A lost
+                # insert race raises IntegrityError → _write re-runs → no-op.
+                key_source = ov["source"] or ""
+                known = s.execute(
+                    select(OverrideTombstone).where(
+                        OverrideTombstone.source == key_source,
+                        OverrideTombstone.override_id == ov["override_id"],
+                    )
+                ).scalar_one_or_none()
+                if known is not None and known.expires_at > mwx.to_db(now_aware):
+                    return 0
+                if known is not None:  # expired leftover of a reused id
+                    s.delete(known)
+                    s.flush()
+                keep = linger if linger is not None else mwx.DEFAULT_LINGER_MINUTES
+                ended = mwx.to_db(ov["ended_at"])
+                s.add(OverrideTombstone(
+                    source=key_source, override_id=ov["override_id"], ended_at=ended,
+                    linger_minutes=keep, expires_at=ended + timedelta(minutes=keep),
+                ))
+                s.commit()
+                return 0
             for row in rows:
-                if row.ended_at is None:  # first "ended" wins — idempotent on re-delivery
-                    row.ended_at = mwx.to_db(ov["ended_at"])
-                if ov["linger_minutes"] is not None:
-                    row.linger_minutes = ov["linger_minutes"]
+                if row.ended_at is not None:
+                    continue  # re-delivered "ended": first end wins, nothing moves
+                row.ended_at = mwx.to_db(ov["ended_at"])
+                if linger is not None:
+                    row.linger_minutes = linger
                 elif row.linger_minutes is None:
                     row.linger_minutes = mwx.DEFAULT_LINGER_MINUTES
                 row.updated_at = now
@@ -1037,6 +1361,9 @@ class EntityRegistryService:
                             (MaintenanceEntry.ended_at.is_not(None)) & (MaintenanceEntry.ended_at < ended_cutoff),
                         ),
                     )
+                )
+                s.execute(
+                    delete(OverrideTombstone).where(OverrideTombstone.expires_at < mwx.to_db(now))
                 )
                 s.commit()
                 return int(res.rowcount or 0)

@@ -4,6 +4,11 @@ Mounted by core at ``/api/plugins/lyndrix.plugin.entity_registry/`` via
 ``ctx.register_routes()``. The registry enforces authentication; routes add
 the plugin-scoped ``api:read`` / ``api:write`` permissions. Every handler
 does its (sync SQLAlchemy) work off the event loop via ``asyncio.to_thread``.
+
+``api:write`` is a baseline grant of every ordinary user (core role registry),
+so everything irreversible or operator-level — merge, retire, register, conflict
+dismissal, catalog reload, choosing an ingest ``source`` — requires the
+separate ``registry:admin`` permission.
 """
 from __future__ import annotations
 
@@ -15,11 +20,15 @@ from pydantic import BaseModel, Field
 
 from core.api import ApiIdentity, require_permission
 
-from ..logic.service import EntityRegistryService, NotFound, RegistryError
+from ..logic.service import EntityRegistryService, MergeConflict, NotFound, RegistryError
 
 PLUGIN_ID = "lyndrix.plugin.entity_registry"
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
+# Deliberately not an ``…:api:*`` name: the core grants those to every
+# INT_VIEWER / INT_USER with no opt-out. Mapped to INT_ADMIN by the manifest.
+PERM_ADMIN = f"plugin:{PLUGIN_ID}:registry:admin"
+MAX_SOURCE_LEN = 64
 # GET /maintenance?ci_ids= — one IN query; keeps a careless consumer from
 # asking for the whole registry in one request.
 MAX_MAINTENANCE_BATCH = 200
@@ -37,6 +46,45 @@ class IdentifyPayload(BaseModel):
 
 class IdentifyBatchPayload(BaseModel):
     items: List[IdentifyPayload] = Field(min_length=1, max_length=1000)
+
+
+class RestIdentifyPayload(IdentifyPayload):
+    """REST variant: ``source`` is optional and derived from the caller (the bus
+    payload above keeps it mandatory — plugins name themselves)."""
+
+    source: Optional[str] = Field(default=None, max_length=MAX_SOURCE_LEN)
+
+
+class RestIdentifyBatchPayload(BaseModel):
+    items: List[RestIdentifyPayload] = Field(min_length=1, max_length=1000)
+
+
+def caller_source(identity: ApiIdentity) -> str:
+    """The provenance an ordinary REST writer reports under: ``user:<name>``."""
+    return f"user:{identity.username}"[:MAX_SOURCE_LEN]
+
+
+def effective_source(identity: ApiIdentity, requested: Optional[str]) -> str:
+    """Provenance for a REST ingest call.
+
+    ``source`` ends up in ``owner_source`` / ``sources`` / identifier provenance,
+    so an ordinary writer must not be able to pose as another system
+    ("iac-orchestrator"). Only ``registry:admin`` (connectors, the system key)
+    may name a source; everyone else gets — or must send — their own identity.
+    """
+    requested = (requested or "").strip()
+    own = caller_source(identity)
+    if not requested or requested == own:
+        return own
+    if identity.allows(PERM_ADMIN):
+        return requested
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"Choosing source '{requested}' requires the registry:admin permission "
+            f"(omit source to report as '{own}')."
+        ),
+    )
 
 
 class RegisterPayload(BaseModel):
@@ -82,6 +130,8 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
         """Run a service call off-loop and map domain errors to HTTP codes."""
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
+        except MergeConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RegistryError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except NotFound as exc:
@@ -163,7 +213,7 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
 
     @router.post("/entities/{uuid}/retire")
     async def retire_entity(
-        uuid: str, identity: ApiIdentity = Depends(require_permission(PERM_WRITE))
+        uuid: str, identity: ApiIdentity = Depends(require_permission(PERM_ADMIN))
     ):
         _ensure_ready()
         entity = await _call(service.retire, uuid, source=identity.username)
@@ -175,8 +225,9 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
     async def merge_entity(
         uuid: str,
         payload: MergePayload,
-        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        identity: ApiIdentity = Depends(require_permission(PERM_ADMIN)),
     ):
+        """Irreversible (no split): admin only."""
         _ensure_ready()
         entity = await _call(service.merge, uuid, payload.drop_uuid, source=identity.username)
         return {"entity": entity}
@@ -184,31 +235,30 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
     # ── Identify / register ────────────────────────────────────────────────────
     @router.post("/identify")
     async def identify(
-        payload: IdentifyPayload, identity: ApiIdentity = Depends(require_permission(PERM_WRITE))
+        payload: RestIdentifyPayload,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
         _ensure_ready()
+        source = effective_source(identity, payload.source)
         return await _call(
             service.identify, payload.entity_type, payload.identifiers,
-            display_name=payload.display_name, attributes=payload.attributes, source=payload.source,
+            display_name=payload.display_name, attributes=payload.attributes, source=source,
         )
 
     @router.post("/identify/batch")
     async def identify_batch(
-        payload: IdentifyBatchPayload,
+        payload: RestIdentifyBatchPayload,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
         """Each item is applied independently; failures are reported per item."""
         _ensure_ready()
-        results: List[Dict[str, Any]] = []
-        for item in payload.items:
-            try:
-                res = await asyncio.to_thread(
-                    service.identify, item.entity_type, item.identifiers,
-                    display_name=item.display_name, attributes=item.attributes, source=item.source,
-                )
-                results.append({"ok": True, **{k: res[k] for k in ("uuid", "created", "conflict")}})
-            except (RegistryError, NotFound) as exc:
-                results.append({"ok": False, "error": str(exc), "identifiers": item.identifiers})
+        # Reject a spoofed source before anything is written (all-or-nothing).
+        sources = [effective_source(identity, item.source) for item in payload.items]
+        # One worker thread and set-based reads for the whole batch.
+        results: List[Dict[str, Any]] = await _call(
+            service.identify_batch,
+            [{**item.model_dump(), "source": source} for item, source in zip(payload.items, sources)],
+        )
         return {
             "results": results,
             "created": sum(1 for r in results if r.get("created")),
@@ -218,8 +268,9 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
 
     @router.post("/register")
     async def register(
-        payload: RegisterPayload, identity: ApiIdentity = Depends(require_permission(PERM_WRITE))
+        payload: RegisterPayload, identity: ApiIdentity = Depends(require_permission(PERM_ADMIN))
     ):
+        """Bring-your-own UUID is a connector/operator action: admin only."""
         _ensure_ready()
         entity, created = await _call(
             service.register, payload.uuid, payload.entity_type, payload.display_name,
@@ -286,7 +337,7 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
     async def dismiss_conflict(
         conflict_id: int,
         payload: DismissPayload,
-        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        identity: ApiIdentity = Depends(require_permission(PERM_ADMIN)),
     ):
         _ensure_ready()
         conflict = await _call(service.dismiss_conflict, conflict_id, reason=payload.reason)
@@ -300,7 +351,7 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
         return await asyncio.to_thread(lambda: service.catalog.catalog.to_payload())
 
     @router.post("/catalog/reload")
-    async def reload_catalog(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
+    async def reload_catalog(identity: ApiIdentity = Depends(require_permission(PERM_ADMIN))):
         def _run() -> dict:
             service.reload_catalog(announce=True)  # peers reload on the cluster event
             return service.catalog.catalog.to_payload()
@@ -309,6 +360,16 @@ def build_plugin_router(service: EntityRegistryService) -> APIRouter:
             return await asyncio.to_thread(_run)
         except Exception as exc:  # invalid YAML must not take the plugin down
             raise HTTPException(status_code=400, detail=f"Catalog reload failed: {exc}") from exc
+
+    @router.get("/access")
+    async def access(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
+        """What the caller may do — lets a UI hide actions instead of offering
+        buttons that end in 403."""
+        return {
+            "write": identity.allows(PERM_WRITE),
+            "admin": identity.allows(PERM_ADMIN),
+            "source": caller_source(identity),
+        }
 
     @router.get("/stats")
     async def stats(identity: ApiIdentity = Depends(require_permission(PERM_READ))):

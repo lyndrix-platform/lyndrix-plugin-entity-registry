@@ -13,8 +13,13 @@ MaintenanceEntry — read-model of the maintenance-window feature: one row per
               (entity, source) with the published windows, one row per
               (entity, source, override_id) for a running override. Evaluated
               at read time, never a source of truth (0.3.0).
+OverrideTombstone — an ``override_ended`` that arrived before its
+              ``override_started``; remembered for the linger period so the
+              late "started" does not activate the override.
 """
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column,
@@ -26,13 +31,29 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    func,
 )
 from sqlalchemy.orm import DeclarativeBase
 
 
 class _Base(DeclarativeBase):
     pass
+
+
+def _utcnow() -> datetime:
+    """Naive UTC, like ``last_seen_at``. Used instead of the DB's ``NOW()``,
+    which follows the server time zone and would mix with the Python-written
+    columns when MariaDB does not run in UTC (ER-06)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def iso_z(dt: datetime | None) -> str | None:
+    """Stored (naive UTC) datetime → timezone-aware ISO string with ``Z``.
+    Browsers parse an offset-less ISO string as local time (ER-06)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class Entity(_Base):
@@ -51,8 +72,8 @@ class Entity(_Base):
     attributes = Column(JSON, nullable=False, default=dict)
     # Set on tombstones: the surviving entity of a merge.
     merged_into = Column(String(36), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=func.now())
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
     last_seen_at = Column(DateTime, nullable=True)
 
     def to_dict(self) -> dict:
@@ -65,9 +86,9 @@ class Entity(_Base):
             "sources": list(self.sources or []),
             "attributes": dict(self.attributes or {}),
             "merged_into": self.merged_into,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+            "created_at": iso_z(self.created_at),
+            "updated_at": iso_z(self.updated_at),
+            "last_seen_at": iso_z(self.last_seen_at),
         }
 
 
@@ -84,14 +105,14 @@ class Identifier(_Base):
     scheme = Column(String(64), nullable=False)
     value = Column(String(255), nullable=False)
     source = Column(String(64), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=func.now())
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
 
     def to_dict(self) -> dict:
         return {
             "scheme": self.scheme,
             "value": self.value,
             "source": self.source,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": iso_z(self.created_at),
         }
 
 
@@ -110,7 +131,7 @@ class Relation(_Base):
     )
     relation = Column(String(64), nullable=False)
     source = Column(String(64), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=func.now())
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
 
     def to_dict(self) -> dict:
         return {
@@ -119,7 +140,7 @@ class Relation(_Base):
             "to_uuid": self.to_uuid,
             "relation": self.relation,
             "source": self.source,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": iso_z(self.created_at),
         }
 
 
@@ -147,7 +168,7 @@ class Conflict(_Base):
     # open | resolved | dismissed
     status = Column(String(16), nullable=False, default="open", index=True)
     resolution = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=func.now())
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
     resolved_at = Column(DateTime, nullable=True)
 
     def to_dict(self) -> dict:
@@ -159,8 +180,8 @@ class Conflict(_Base):
             "source": self.source,
             "status": self.status,
             "resolution": self.resolution,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "created_at": iso_z(self.created_at),
+            "resolved_at": iso_z(self.resolved_at),
         }
 
 
@@ -205,10 +226,10 @@ class MaintenanceEntry(_Base):
     ended_at = Column(DateTime, nullable=True)
     linger_minutes = Column(Integer, nullable=True)
     reason = Column(Text, nullable=True)
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
 
     def to_dict(self) -> dict:
-        iso = lambda dt: dt.isoformat() if dt else None  # noqa: E731
+        iso = iso_z
         return {
             "id": self.id,
             "entity_uuid": self.entity_uuid,
@@ -226,3 +247,28 @@ class MaintenanceEntry(_Base):
             "reason": self.reason,
             "updated_at": iso(self.updated_at),
         }
+
+
+class OverrideTombstone(_Base):
+    """An ``override_ended`` for an override no row exists for (yet).
+
+    Bus events are handled as concurrent tasks, so a quick deploy's "ended"
+    can be committed before its "started" (also: re-delivery, an emitter on
+    another instance). The tombstone carries the end time until
+    ``expires_at`` (= ``ended_at`` + linger); a "started" for the same
+    ``(source, override_id)`` arriving in that time is stored already ended.
+    ``source`` is ``""`` when the "ended" named no source (matches any).
+    """
+
+    __tablename__ = "registry_maintenance_tombstones"
+    __table_args__ = (
+        UniqueConstraint("source", "override_id", name="uq_registry_maintenance_tombstone"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String(64), nullable=False, default="")
+    override_id = Column(String(64), nullable=False)
+    ended_at = Column(DateTime, nullable=False)
+    linger_minutes = Column(Integer, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)

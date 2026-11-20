@@ -34,6 +34,7 @@ app/ui/react/              # React-UI (Bundle → app/ui/static/ui_bundle.js)
 | `registry_relations` | gerichtete, benannte Kante `(from_uuid, to_uuid, relation)` eindeutig |
 | `registry_conflicts` | geparkte Mehrdeutigkeiten mit Kandidaten, auslösenden Identifiern, `status` (`open` / `resolved` / `dismissed`) |
 | `registry_maintenance` | Read-Model der Wartungsfenster (ab 0.3.0): `kind` (`window` / `override`), `source`, `override_id` (`""` bei Fenstern), `windows` (JSON, Normalform), `inherited_from`, `deploy_policy`, `incidents` (JSON), `until` / `started_at` / `ended_at` / `linger_minutes` / `reason` (Overrides); **eindeutig** über `(entity_uuid, source, kind, override_id)`. Siehe [Wartungsfenster am CI](#wartungsfenster-am-ci). |
+| `registry_maintenance_tombstones` | Merkt ein `maintenance:override_ended`, das vor seinem `override_started` eintrifft (ab 0.4.0); der späte Start wird dann bereits beendet gespeichert. |
 
 **Identifier vs. Attribute.** Identifier sind Schlüssel, die eine Entität eindeutig bezeichnen
 (`pve.vm`, `iac.host`, `fqdn`, …). Schwache, wiederverwendbare Fakten wie IP-Adressen sind **keine**
@@ -58,6 +59,9 @@ Entität hinter einer Menge `{schema: wert}`:
 
 `merge(keep, drop)` hängt Identifier und Beziehungen um, vereinigt Attribute/Quellen, lässt den
 alten Datensatz als Tombstone (`status=merged`, `merged_into`) stehen — alte UUIDs lösen weiter auf.
+Seit 0.4.0 übernimmt die überlebende Entität auch die Wartungsfenster und Overrides der weggefallenen.
+Gleichzeitige Merges in Gegenrichtung können keinen Tombstone-Zyklus erzeugen: die Entitäten werden in
+UUID-Reihenfolge gesperrt, der Verlierer erhält HTTP 409.
 
 ## Katalog (`catalog/entity_types.yml`)
 
@@ -115,6 +119,8 @@ ein abweichender Wert wird mit 403 abgelehnt. Die Bus-Schnittstelle ist davon un
 | `GET` | `/stats` | Zähler je Typ, Identifier, Beziehungen, offene Konflikte |
 | `GET` | `/access` | Was der Aufrufer darf: `{write, admin, source}` — die UI blendet damit Admin-Aktionen aus |
 
+Alle Zeitstempel der API sind ISO 8601 mit `Z` (UTC); `created_at`/`updated_at` werden seit 0.4.0 aus Python-UTC statt DB-`NOW()` geschrieben.
+
 ## Event-Bus
 
 ### Konsumiert
@@ -128,7 +134,7 @@ ein abweichender Wert wird mit 403 abgelehnt. Die Bus-Schnittstelle ist davon un
 | `entity_registry:retire` | `{uuid, source?}` | stilllegen |
 | `maintenance:windows_published` | `{source, published_at, replaces, items: [{ci_id, kind, name, windows, inherited_from, deploy_policy?, incidents?, host_ci_id?}]}` | Read-Model-Feed (Core-API 1.13): bei `replaces: true` werden alle Fenster-Zeilen dieser `source` in **einer** Transaktion ersetzt; unbekannte `ci_id`s werden übersprungen und gezählt, Merge-Tombstones aufgelöst; `kind`/`name`/`host_ci_id` des Items sind informativ (der Typ steht an der Entität) |
 | `maintenance:override_started` | `{override_id, ci_ids, until, reason, source, started_at, linger_minutes}` | Upsert je `(Entität, source, override_id)`; eine erneute Zustellung legt keine zweite Zeile an |
-| `maintenance:override_ended` | `{override_id, source, ended_at, linger_minutes}` | setzt `ended_at`/`linger_minutes` (das erste Ende gewinnt); nur Zeilen derselben `source`, wenn sie mitgeschickt wird |
+| `maintenance:override_ended` | `{override_id, source, ended_at, linger_minutes}` | setzt `ended_at`/`linger_minutes` (das erste Ende gewinnt; ein Ende vor dem Start wird in `registry_maintenance_tombstones` gemerkt, ein erneut zugestelltes Ende verschiebt `until` nicht); nur Zeilen derselben `source`, wenn sie mitgeschickt wird |
 
 Für den Request/Response-Fall nutzt das sendende Plugin `await ctx.request("entity_registry:identify",
 payload, reply_topic="entity_registry:identified", timeout=5)` (Core-API ≥ 1.4). Kommt keine

@@ -1,73 +1,75 @@
-# Entity Registry — Dokumentation
+# Entity Registry — Documentation
 
-## Überblick
+## Overview
 
-Die Entity Registry vergibt jedem Configuration Item (CI) der Plattform **eine stabile UUID** und
-hält fest, unter welchen Kennungen die verschiedenen Plugins dasselbe Ding kennen. Vorher war
-jede Plugin-übergreifende Referenz der IaC-Hostname als String (Monitoring `host:<name>`,
-Docker-Manager Host-`name`, Server-Manager `external_id`) — eine Umbenennung riss alle Verbindungen
-ab. Mit der Registry speichert jedes Plugin die UUID; die Registry sorgt dafür, dass ein
-umbenannter Host (gleiche Proxmox-VMID) dieselbe UUID behält.
+The Entity Registry assigns every configuration item (CI) of the platform **a stable UUID** and
+records under which identifiers the various plugins know the same thing. Previously every
+cross-plugin reference was the IaC hostname as a string (Monitoring `host:<name>`,
+Docker Manager host `name`, Server Manager `external_id`) — a rename broke all connections.
+With the registry, each plugin stores the UUID; the registry ensures that a renamed host
+(same Proxmox VMID) keeps the same UUID.
 
-Die Registry ist bewusst **klein**: Sie identifiziert, verknüpft und löst Konflikte auf. Sie
-enthält keine Prozesslogik — die lebt im ITSM-Plugin.
+The registry is deliberately **small**: it identifies, links and resolves conflicts. It
+contains no process logic — that lives in the ITSM plugin.
 
-## Architektur
+## Architecture
 
 ```
-catalog/entity_types.yml   # Entitätstypen, Identifier-Schemata, Beziehungen
+catalog/entity_types.yml   # entity types, identifier schemas, relations
 app/model/models.py        # Entity / Identifier / Relation / Conflict / MaintenanceEntry
-app/model/database.py      # Session-Helfer + Tabellen-Bootstrap (handgeschriebene Migration)
-app/logic/catalog.py       # validierter Katalog-Loader (pydantic)
-app/logic/service.py       # identify / register / merge / relate / retire / Wartungs-Read-Model
-app/logic/maintenance.py   # Payload-Normalisierung + Auswertung über core.api.maintenance (optional)
-app/api/__init__.py        # REST-Router — beide UIs nutzen nur diesen
-app/ui/react/              # React-UI (Bundle → app/ui/static/ui_bundle.js)
+app/model/database.py      # session helpers + table bootstrap (hand-written migration)
+app/logic/catalog.py       # validated catalog loader (pydantic)
+app/logic/service.py       # identify / register / merge / relate / retire / maintenance read model
+app/logic/maintenance.py   # payload normalisation + evaluation via core.api.maintenance (optional)
+app/api/__init__.py        # REST router — both UIs use only this
+app/ui/react/              # React UI (bundle → app/ui/static/ui_bundle.js)
 ```
 
-### Datenmodell
+### Data model
 
-| Tabelle | Inhalt |
+| Table | Content |
 |---|---|
-| `registry_entities` | `uuid` (PK), `entity_type`, `display_name`, `status` (`active` / `retired` / `merged`), `owner_source`, `sources` (JSON, „gesehen von“), `attributes` (JSON), `merged_into`, Zeitstempel |
-| `registry_identifiers` | `(scheme, value)` **eindeutig** → `entity_uuid`. Genau ein Besitzer pro Paar — die Datenbank erzwingt das. |
-| `registry_relations` | gerichtete, benannte Kante `(from_uuid, to_uuid, relation)` eindeutig |
-| `registry_conflicts` | geparkte Mehrdeutigkeiten mit Kandidaten, auslösenden Identifiern, `status` (`open` / `resolved` / `dismissed`) |
-| `registry_maintenance` | Read-Model der Wartungsfenster (ab 0.3.0): `kind` (`window` / `override`), `source`, `override_id` (`""` bei Fenstern), `windows` (JSON, Normalform), `inherited_from`, `deploy_policy`, `incidents` (JSON), `until` / `started_at` / `ended_at` / `linger_minutes` / `reason` (Overrides); **eindeutig** über `(entity_uuid, source, kind, override_id)`. Siehe [Wartungsfenster am CI](#wartungsfenster-am-ci). |
+| `registry_entities` | `uuid` (PK), `entity_type`, `display_name`, `status` (`active` / `retired` / `merged`), `owner_source`, `sources` (JSON, "seen by"), `attributes` (JSON), `merged_into`, timestamps |
+| `registry_identifiers` | `(scheme, value)` **unique** → `entity_uuid`. Exactly one owner per pair — the database enforces this. |
+| `registry_relations` | directed, named edge `(from_uuid, to_uuid, relation)` unique |
+| `registry_conflicts` | parked ambiguities with candidates, triggering identifiers, `status` (`open` / `resolved` / `dismissed`) |
+| `registry_maintenance` | read model of the maintenance windows (from 0.3.0): `kind` (`window` / `override`), `source`, `override_id` (`""` for windows), `windows` (JSON, normal form), `inherited_from`, `deploy_policy`, `incidents` (JSON), `until` / `started_at` / `ended_at` / `linger_minutes` / `reason` (overrides); **unique** over `(entity_uuid, source, kind, override_id)`. See [Maintenance windows on a CI](#maintenance-windows-on-a-ci). |
+| `registry_maintenance_tombstones` | records a `maintenance:override_ended` that arrives before its `override_started` (from 0.4.0); the late start is then stored as already ended. |
 
-**Identifier vs. Attribute.** Identifier sind Schlüssel, die eine Entität eindeutig bezeichnen
-(`pve.vm`, `iac.host`, `fqdn`, …). Schwache, wiederverwendbare Fakten wie IP-Adressen sind **keine**
-Identifier, sondern Attribute — sonst würde eine neu vergebene IP zwei Maschinen zusammenführen.
+**Identifiers vs. attributes.** Identifiers are keys that uniquely designate an entity
+(`pve.vm`, `iac.host`, `fqdn`, …). Weak, reusable facts such as IP addresses are **not**
+identifiers but attributes — otherwise a newly assigned IP would merge two machines.
 
 ### Reconciliation (`identify`)
 
-`identify(entity_type, identifiers, display_name, attributes, source)` findet oder erzeugt die
-Entität hinter einer Menge `{schema: wert}`:
+`identify(entity_type, identifiers, display_name, attributes, source)` finds or creates the
+entity behind a set `{schema: value}`:
 
-1. Alle übergebenen Identifier werden nachgeschlagen (Merge-Tombstones werden zur überlebenden
-   Entität aufgelöst).
-2. **Kein Treffer** → neue UUID, alle Identifier werden angelegt.
-3. **Genau ein Treffer** → fehlende Identifier werden als Aliase gelernt (daher überlebt eine
-   Umbenennung: neuer `iac.host`, gleiche `pve.vm` ⇒ gleiche UUID), `display_name` und `attributes`
-   werden aktualisiert, die Quelle wird zu `sources` ergänzt, eine stillgelegte Entität wird wieder
-   aktiv.
-4. **Mehrere Treffer** → **kein automatischer Merge.** Zurückgegeben wird die Entität, die über
-   das Schema mit der niedrigsten `priority`-Zahl getroffen wurde; ein Konflikt wird (einmal pro
-   Kandidatenmenge) abgelegt und `entity_registry:conflict` emittiert. Zusammenführen ist eine
-   Entscheidung für Menschen (UI → Konflikte).
+1. All passed identifiers are looked up (merge tombstones are resolved to the surviving
+   entity).
+2. **No hit** → new UUID, all identifiers are created.
+3. **Exactly one hit** → missing identifiers are learned as aliases (so a rename survives: new
+   `iac.host`, same `pve.vm` ⇒ same UUID), `display_name` and `attributes` are updated, the
+   source is added to `sources`, and a retired entity becomes active again.
+4. **Multiple hits** → **no automatic merge.** The entity matched via the schema with the lowest
+   `priority` number is returned; a conflict is recorded (once per candidate set) and
+   `entity_registry:conflict` is emitted. Merging is a decision for humans (UI → Conflicts).
 
-`merge(keep, drop)` hängt Identifier und Beziehungen um, vereinigt Attribute/Quellen, lässt den
-alten Datensatz als Tombstone (`status=merged`, `merged_into`) stehen — alte UUIDs lösen weiter auf.
+`merge(keep, drop)` re-attaches identifiers and relations, unifies attributes/sources, and leaves
+the old record as a tombstone (`status=merged`, `merged_into`) — old UUIDs continue to resolve.
+Since 0.4.0 the surviving entity also takes over the maintenance windows and overrides of the
+dropped one. Concurrent merges in opposite directions cannot produce a tombstone cycle: the
+entities are locked in UUID order, and the loser receives HTTP 409.
 
-## Katalog (`catalog/entity_types.yml`)
+## Catalog (`catalog/entity_types.yml`)
 
 ```yaml
 entity_types:        # host, hypervisor, service, container, network, itsm_record, generic
   - {id: host, label: Host, icon: dns, description: ...}
-identifier_schemes:  # niedrigere priority gewinnt bei Konflikten
+identifier_schemes:  # lower priority wins on conflicts
   - {id: pve.vm, label: Proxmox VM/CT, priority: 10}      # "<node>/<vmid>"
   - {id: iac.host, label: IaC inventory host key, priority: 20}
-  - {id: iac.service, label: IaC service instance, priority: 20}  # "<host>/<service.name>" (ab 0.3.0)
+  - {id: iac.service, label: IaC service instance, priority: 20}  # "<host>/<service.name>" (from 0.3.0)
   - {id: fqdn, priority: 30}
   - {id: docker.container, priority: 40}                   # "<host>/<name>"
   - {id: server_manager.id, priority: 50}
@@ -78,85 +80,87 @@ identifier_schemes:  # niedrigere priority gewinnt bei Konflikten
 relations:           # runs_on/hosts, depends_on/required_by, member_of/has_member, affects/affected_by, related_to
 ```
 
-Unbekannte Typen, Schemata oder Beziehungen werden abgelehnt (HTTP 400). `POST /catalog/reload`
-lädt die Datei neu; ein ungültiger Katalog lässt die alte Version aktiv.
+Unknown types, schemas or relations are rejected (HTTP 400). `POST /catalog/reload`
+reloads the file; an invalid catalog leaves the old version active.
 
-## REST-API
+## REST API
 
-Basis: `/api/plugins/lyndrix.plugin.entity_registry/` (authentifiziert; Rechte
-`plugin:lyndrix.plugin.entity_registry:api:read` bzw. `api:write`).
+Base: `/api/plugins/lyndrix.plugin.entity_registry/` (authenticated; permissions
+`plugin:lyndrix.plugin.entity_registry:api:read` resp. `api:write`).
 
-`api:write` erhält im Core jeder normale Benutzer (`INT_USER`). Alles Unumkehrbare bzw.
-Betreiber-Relevante verlangt deshalb das eigene Recht
-`plugin:lyndrix.plugin.entity_registry:registry:admin` (Rolle `admin`, Gruppe `INT_ADMIN`):
+`api:write` is granted in the core to every normal user (`INT_USER`). Everything irreversible or
+operator-relevant therefore requires its own permission
+`plugin:lyndrix.plugin.entity_registry:registry:admin` (role `admin`, group `INT_ADMIN`):
 `/entities/{uuid}/merge`, `/entities/{uuid}/retire`, `/register`, `/conflicts/{id}/dismiss`,
-`/catalog/reload` sowie die freie Wahl von `source` bei `/identify` und `/identify/batch`.
-Ohne dieses Recht ist `source` optional und wird aus der Identität abgeleitet (`user:<name>`);
-ein abweichender Wert wird mit 403 abgelehnt. Die Bus-Schnittstelle ist davon unberührt.
+`/catalog/reload`, and the free choice of `source` in `/identify` and `/identify/batch`.
+Without this permission `source` is optional and is derived from the identity (`user:<name>`);
+a deviating value is rejected with 403. The bus interface is unaffected by this.
 
-| Methode | Pfad | Zweck |
+| Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/identify` | Find-or-create; Antwort `{uuid, created, conflict, entity}` |
-| `POST` | `/identify/batch` | `{items: [...]}` → Ergebnis pro Eintrag (`created`/`conflicts`/`failed`) |
-| `POST` | `/register` | Entität mit eigener UUID anlegen/aktualisieren (z. B. ITSM-Datensätze) |
-| `GET` | `/entities?type=&q=&status=&limit=&offset=&in_maintenance=` | Liste; `q` sucht in Name **und** Identifier-Werten. Jede Zeile trägt `maintenance: {active, until, source}`. `in_maintenance=true` behält nur Entitäten, die **jetzt** in Wartung sind (seitenweise ausgewertet — `total` zählt dann die Treffer der Seite) |
-| `GET` | `/entities/{uuid}` | Detail inkl. Identifier, Beziehungen und vollem `maintenance`-Feld (folgt Merge-Tombstones) |
-| `GET` | `/entities/{uuid}/host` | Host-Entität über die ausgehende `runs_on`-Beziehung: `{host, relation}`; 404 ohne Beziehung |
-| `GET` | `/maintenance?ci_ids=a,b,c` | Batch-Read-Model für Konsumenten (max. 200 IDs): `{now, maintenance: {ci_id: state \| null}}`; Tombstones lösen zur überlebenden Entität auf (`uuid` im State), unbekannte IDs → `null` |
-| `PATCH` | `/entities/{uuid}` | `display_name` / `attributes` ändern |
-| `POST` | `/entities/{uuid}/retire` | stilllegen (ein erneutes `identify` reaktiviert) |
-| `POST` | `/entities/{uuid}/merge` | `{drop_uuid}` in diese Entität zusammenführen |
-| `GET` | `/lookup?scheme=&value=` | Entität zu einem Identifier |
-| `GET` | `/resolve?ref=&type=` | Eine Referenz zu **genau einer** Entität auflösen: UUID (folgt Merge-Tombstones), `schema:wert` (`pve.vm:hydra/8003`), reiner Identifier-Wert (`docker-hydra`) oder Anzeigename. Antwort immer 200: `{entity\|null, match, candidates}` — bei Mehrdeutigkeit `entity: null`, `match: "ambiguous"` und die Kandidaten; es wird nie geraten und nie angelegt |
-| `POST` / `DELETE` | `/entities/{uuid}/relations[/{relation}/{to_uuid}]` | Beziehungen |
-| `GET` | `/conflicts?status=open` | Konfliktliste |
-| `POST` | `/conflicts/{id}/dismiss` | Konflikt verwerfen („das sind wirklich zwei Dinge“) |
-| `GET` / `POST` | `/catalog` / `/catalog/reload` | Katalog lesen / neu laden |
-| `GET` | `/stats` | Zähler je Typ, Identifier, Beziehungen, offene Konflikte |
-| `GET` | `/access` | Was der Aufrufer darf: `{write, admin, source}` — die UI blendet damit Admin-Aktionen aus |
+| `POST` | `/identify` | Find-or-create; response `{uuid, created, conflict, entity}` |
+| `POST` | `/identify/batch` | `{items: [...]}` → result per entry (`created`/`conflicts`/`failed`) |
+| `POST` | `/register` | create/update an entity with its own UUID (e.g. ITSM records) |
+| `GET` | `/entities?type=&q=&status=&limit=&offset=&in_maintenance=` | list; `q` searches the name **and** identifier values. Each row carries `maintenance: {active, until, source}`. `in_maintenance=true` keeps only entities that are **now** in maintenance (evaluated per page — `total` then counts the matches on the page) |
+| `GET` | `/entities/{uuid}` | detail incl. identifiers, relations and the full `maintenance` field (follows merge tombstones) |
+| `GET` | `/entities/{uuid}/host` | host entity via the outgoing `runs_on` relation: `{host, relation}`; 404 without the relation |
+| `GET` | `/maintenance?ci_ids=a,b,c` | batch read model for consumers (max. 200 IDs): `{now, maintenance: {ci_id: state \| null}}`; tombstones resolve to the surviving entity (`uuid` in the state), unknown IDs → `null` |
+| `PATCH` | `/entities/{uuid}` | change `display_name` / `attributes` |
+| `POST` | `/entities/{uuid}/retire` | retire (a new `identify` reactivates) |
+| `POST` | `/entities/{uuid}/merge` | merge `{drop_uuid}` into this entity |
+| `GET` | `/lookup?scheme=&value=` | entity for an identifier |
+| `GET` | `/resolve?ref=&type=` | resolve one reference to **exactly one** entity: UUID (follows merge tombstones), `schema:value` (`pve.vm:hydra/8003`), a bare identifier value (`docker-hydra`) or a display name. Response is always 200: `{entity\|null, match, candidates}` — on ambiguity `entity: null`, `match: "ambiguous"` and the candidates; it never guesses and never creates |
+| `POST` / `DELETE` | `/entities/{uuid}/relations[/{relation}/{to_uuid}]` | relations |
+| `GET` | `/conflicts?status=open` | conflict list |
+| `POST` | `/conflicts/{id}/dismiss` | dismiss a conflict ("these really are two things") |
+| `GET` / `POST` | `/catalog` / `/catalog/reload` | read / reload the catalog |
+| `GET` | `/stats` | counters per type, identifier, relation, open conflicts |
+| `GET` | `/access` | what the caller may do: `{write, admin, source}` — the UI uses this to hide admin actions |
 
-## Event-Bus
+All timestamps of the API are ISO 8601 with `Z` (UTC); since 0.4.0 `created_at`/`updated_at` are written from Python UTC instead of the DB `NOW()`.
 
-### Konsumiert
+## Event bus
 
-| Topic | Payload | Verhalten |
+### Consumed
+
+| Topic | Payload | Behaviour |
 |---|---|---|
-| `entity_registry:identify` | `{entity_type, identifiers, display_name?, attributes?, source, request_id?}` oder `{items: [...], request_id?}` | Antwort auf `entity_registry:identified` mit demselben `request_id`: `{ok, uuid, created, conflict}` bzw. `{ok, results: [...]}` |
-| `entity_registry:register` | `{uuid, entity_type, display_name, identifiers?, attributes?, source}` | Bring-your-own-UUID |
-| `entity_registry:lookup` | `{ref, entity_type?, request_id}` oder `{scheme, value, request_id}` | Nur-Lese-Auflösung wie `GET /resolve`; Antwort auf `entity_registry:lookup_result`: `{request_id, ok, entity\|null, match, candidates}`. So löst z. B. das ITSM-Plugin `docker-hydra` zur CI-UUID auf |
-| `entity_registry:relate` / `unrelate` | `{from_uuid, to_uuid, relation, source?}` | Beziehung anlegen / entfernen |
-| `entity_registry:retire` | `{uuid, source?}` | stilllegen |
-| `maintenance:windows_published` | `{source, published_at, replaces, items: [{ci_id, kind, name, windows, inherited_from, deploy_policy?, incidents?, host_ci_id?}]}` | Read-Model-Feed (Core-API 1.13): bei `replaces: true` werden alle Fenster-Zeilen dieser `source` in **einer** Transaktion ersetzt; unbekannte `ci_id`s werden übersprungen und gezählt, Merge-Tombstones aufgelöst; `kind`/`name`/`host_ci_id` des Items sind informativ (der Typ steht an der Entität) |
-| `maintenance:override_started` | `{override_id, ci_ids, until, reason, source, started_at, linger_minutes}` | Upsert je `(Entität, source, override_id)`; eine erneute Zustellung legt keine zweite Zeile an |
-| `maintenance:override_ended` | `{override_id, source, ended_at, linger_minutes}` | setzt `ended_at`/`linger_minutes` (das erste Ende gewinnt); nur Zeilen derselben `source`, wenn sie mitgeschickt wird |
+| `entity_registry:identify` | `{entity_type, identifiers, display_name?, attributes?, source, request_id?}` or `{items: [...], request_id?}` | reply on `entity_registry:identified` with the same `request_id`: `{ok, uuid, created, conflict}` resp. `{ok, results: [...]}` |
+| `entity_registry:register` | `{uuid, entity_type, display_name, identifiers?, attributes?, source}` | bring-your-own-UUID |
+| `entity_registry:lookup` | `{ref, entity_type?, request_id}` or `{scheme, value, request_id}` | read-only resolution like `GET /resolve`; reply on `entity_registry:lookup_result`: `{request_id, ok, entity\|null, match, candidates}`. For example, the ITSM plugin uses this to resolve `docker-hydra` to a CI UUID |
+| `entity_registry:relate` / `unrelate` | `{from_uuid, to_uuid, relation, source?}` | create / remove a relation |
+| `entity_registry:retire` | `{uuid, source?}` | retire |
+| `maintenance:windows_published` | `{source, published_at, replaces, items: [{ci_id, kind, name, windows, inherited_from, deploy_policy?, incidents?, host_ci_id?}]}` | read-model feed (core API 1.13): with `replaces: true` all window rows of this `source` are replaced in **one** transaction; unknown `ci_id`s are skipped and counted, merge tombstones are resolved; the item's `kind`/`name`/`host_ci_id` are informational (the type lives on the entity) |
+| `maintenance:override_started` | `{override_id, ci_ids, until, reason, source, started_at, linger_minutes}` | upsert per `(entity, source, override_id)`; a redelivery does not create a second row |
+| `maintenance:override_ended` | `{override_id, source, ended_at, linger_minutes}` | sets `ended_at`/`linger_minutes` (the first end wins; an end before the start is recorded in `registry_maintenance_tombstones`, a redelivered end does not move `until`); only rows of the same `source`, if it is sent along |
 
-Für den Request/Response-Fall nutzt das sendende Plugin `await ctx.request("entity_registry:identify",
-payload, reply_topic="entity_registry:identified", timeout=5)` (Core-API ≥ 1.4). Kommt keine
-Antwort (Registry nicht geladen), liefert `ctx.request` `None` — der Aufrufer arbeitet dann ohne
-UUID weiter und holt sie beim nächsten Sync nach.
+For the request/response case the sending plugin uses `await ctx.request("entity_registry:identify",
+payload, reply_topic="entity_registry:identified", timeout=5)` (core API ≥ 1.4). If no reply
+comes (registry not loaded), `ctx.request` returns `None` — the caller then continues without a
+UUID and fetches it on the next sync.
 
-Ungültige Payloads (kein Objekt, Pflichtfelder fehlen, Datenbank nicht bereit) werden mit
-`entity_registry:ingest_failed` beantwortet — auch für die `maintenance:*`-Topics.
+Invalid payloads (not an object, required fields missing, database not ready) are answered with
+`entity_registry:ingest_failed` — also for the `maintenance:*` topics.
 
-### Emittiert
+### Emitted
 
-`entity_registry:identified` und `entity_registry:lookup_result` (Antworten), `entity_created`,
+`entity_registry:identified` and `entity_registry:lookup_result` (replies), `entity_created`,
 `entity_updated` (`{entity, changes}`), `entity_merged` (`{keep, drop_uuid}`), `entity_retired`,
-`conflict`, `ingest_failed` (`{topic, error, payload_keys}` — Fehler bei Pushes ohne `request_id`),
-`entity_registry:catalog_reloaded` (`{reloaded_at}`, clusterweit nach `POST /catalog/reload`),
+`conflict`, `ingest_failed` (`{topic, error, payload_keys}` — errors on pushes without `request_id`),
+`entity_registry:catalog_reloaded` (`{reloaded_at}`, cluster-wide after `POST /catalog/reload`),
 `entity_registry:maintenance_changed` (`cluster=True`; `{source, kind: window|override, count, override_id?, …}` —
-**ein** Sammel-Event je verarbeitetem `maintenance:*`-Event, kein `entity_updated` pro Entität;
-UIs laden daraufhin neu).
+**one** aggregate event per processed `maintenance:*` event, not one `entity_updated` per entity;
+UIs reload upon it).
 
-## Wartungsfenster am CI
+## Maintenance windows on a CI
 
-Ab 0.3.0 ist die Registry **Konsument** des Wartungsfenster-Vertrags (Core-API 1.13,
-`lyndrix-core/docs/plugins.md` → *Maintenance windows*). Sie besitzt keine Fenster: Der
-IaC-Orchestrator publiziert, was Controller und `service.yml` definieren, das Monitoring seine
-manuellen Fenster; jeder laufende Deploy ist ein Override. Die Registry speichert das je Quelle in
-`registry_maintenance` und wertet **beim Lesen** aus — ohne Timer, ohne Pro-Entity-Events.
+From 0.3.0 the registry is a **consumer** of the maintenance window contract (core API 1.13,
+`lyndrix-core/docs/plugins.md` → *Maintenance windows*). It owns no windows: the IaC orchestrator
+publishes what controller and `service.yml` define, monitoring publishes its manual windows; every
+running deploy is an override. The registry stores this per source in `registry_maintenance` and
+evaluates **at read time** — without timers, without per-entity events.
 
-**Auswertung.** `GET /entities/{uuid}` liefert
+**Evaluation.** `GET /entities/{uuid}` returns
 
 ```json
 "maintenance": {
@@ -170,102 +174,98 @@ manuellen Fenster; jeder laufende Deploy ist ein Override. Die Registry speicher
 }
 ```
 
-- `active`/`until`/`source`/`next_start` kommen aus `core.api.maintenance.effective_state` über
-  die Fenster **aller** Quellen plus die gespeicherten Overrides. Ein aktives Override gewinnt
-  (`source: "override"`), `until` ist das spätere der beiden Enden. `overrides` listet nur die
-  gerade aktiven (bis `until`, nach `override_ended` noch `linger_minutes`).
-- `incidents` und `deploy_policy` auf oberster Ebene stammen von der ersten Quelle (alphabetisch),
-  die sie liefert — heute nur der Orchestrator.
-- **Ohne Core-Bibliothek** (Core < 1.11, `min_core_version` bleibt 1.4.0) werden Fenster roh
-  gespeichert und geliefert; `active` ist dann `null`, sobald Fenster existieren („nicht
-  auswertbar“). Overrides brauchen keine Bibliothek und werden trotzdem ausgewertet.
-- Abgelaufene Overrides werden beim Lesen ignoriert und einen Tag nach ihrem wirksamen Ende
-  gelöscht (beendete Zeilen nach zwei Tagen, weil `ended_at + linger` nicht portabel in SQL
-  steht); der Sweep läuft beim nächsten Override-Event mit.
+- `active`/`until`/`source`/`next_start` come from `core.api.maintenance.effective_state` over the
+  windows of **all** sources plus the stored overrides. An active override wins
+  (`source: "override"`), `until` is the later of the two ends. `overrides` lists only those
+  currently active (until `until`, and after `override_ended` for `linger_minutes`).
+- `incidents` and `deploy_policy` at the top level come from the first source (alphabetically)
+  that supplies them — today only the orchestrator.
+- **Without the core library** (core < 1.11, `min_core_version` stays 1.4.0) windows are stored and
+  returned raw; `active` is then `null` as soon as windows exist ("not evaluable"). Overrides need
+  no library and are evaluated anyway.
+- Expired overrides are ignored on read and deleted one day after their effective end (ended rows
+  after two days, because `ended_at + linger` is not portable SQL); the sweep runs along with the
+  next override event.
 
-**Idempotenz und Cluster.** `maintenance:*` wird vom Emitter lokal gesendet; die Registry läuft
-auf jeder Instanz, der lokale Handler schreibt die gemeinsame DB. Trotzdem sind alle Handler
-idempotent (Unique-Key, `delete`+`insert` je `source` in einer Transaktion, Upsert je
-`override_id`, Retry bei 1020/1205/1213), sodass eine spätere `cluster=True`-Zustellung keinen
-Schaden anrichtet. `replaces` wirkt nur innerhalb derselben `source` — kein Emitter kann die
-Fenster eines anderen löschen.
+**Idempotency and cluster.** `maintenance:*` is sent locally by the emitter; the registry runs on
+every instance, and the local handler writes the shared DB. Nevertheless all handlers are
+idempotent (unique key, `delete`+`insert` per `source` in one transaction, upsert per
+`override_id`, retry on 1020/1205/1213), so a later `cluster=True` delivery does no harm.
+`replaces` applies only within the same `source` — no emitter can delete another's windows.
 
-**Host eines Services.** Der Orchestrator identifiziert Services als `entity_type: service` mit
-`iac.service = "<host>/<service.name>"` und setzt `runs_on` Service → Host.
-`GET /entities/{uuid}/host` folgt dieser Kante (404, wenn sie fehlt); Konsumenten, die den Host
-auch ohne Registry brauchen, nutzen das `host_ci_id` aus den Events.
+**Host of a service.** The orchestrator identifies services as `entity_type: service` with
+`iac.service = "<host>/<service.name>"` and sets `runs_on` service → host.
+`GET /entities/{uuid}/host` follows this edge (404 if it is missing); consumers that need the host
+even without the registry use the `host_ci_id` from the events.
 
-## Cluster-Betrieb (ab 0.2.0)
+## Cluster operation (from 0.2.0)
 
-Läuft der Core mit mehreren Instanzen (`LYNDRIX_CLUSTER_MODE=cluster`), arbeitet die Registry auf
-jeder Instanz; der gesamte Zustand liegt in der gemeinsamen MariaDB.
+If the core runs with several instances (`LYNDRIX_CLUSTER_MODE=cluster`), the registry works on
+every instance; the entire state lives in the shared MariaDB.
 
-- **Bootstrap:** Tabellen und Migrationen laufen unter `db_instance.advisory_lock("lyndrix_bootstrap")`
-  im Thread-Pool. Ein verlorenes Rennen („Tabelle/Spalte/Index existiert bereits“, 1050/1060/1061)
-  gilt als Erfolg; schlägt der Bootstrap fehl, wird er bis zu fünfmal wiederholt.
-- **Schreibzugriffe** laufen mit READ COMMITTED und werden bei MariaDB-Fehler 1020/1205/1213
-  (Snapshot-Isolation, Lock-Timeout, Deadlock) kurz wiederholt. `last_seen_at` wird bei sonst
-  unverändertem Objekt höchstens alle 30 s geschrieben.
-- **Wettläufe um eindeutige Schlüssel:** Legt eine andere Instanz denselben Identifier gleichzeitig
-  an, liest `identify()` neu und übernimmt die Beobachtung in die Gewinner-Entität. Offene Konflikte
-  tragen den eindeutigen Schlüssel `open_fingerprint` (NULL nach Auflösung) und werden so nur einmal
-  abgelegt.
-- **Katalog:** `POST /catalog/reload` lädt lokal neu und sendet `entity_registry:catalog_reloaded`
-  mit `cluster=True`; die anderen Instanzen laden daraufhin ebenfalls neu.
-- **`health()`** prüft nur `SELECT 1` und zählt offene Konflikte.
+- **Bootstrap:** tables and migrations run under `db_instance.advisory_lock("lyndrix_bootstrap")`
+  in the thread pool. A lost race ("table/column/index already exists", 1050/1060/1061) counts as
+  success; if the bootstrap fails, it is retried up to five times.
+- **Write access** runs with READ COMMITTED and is briefly retried on MariaDB errors 1020/1205/1213
+  (snapshot isolation, lock timeout, deadlock). `last_seen_at` is written at most every 30 s when
+  the object is otherwise unchanged.
+- **Races on unique keys:** if another instance creates the same identifier at the same time,
+  `identify()` re-reads and merges the observation into the winning entity. Open conflicts carry
+  the unique key `open_fingerprint` (NULL after resolution) and so are recorded only once.
+- **Catalog:** `POST /catalog/reload` reloads locally and sends `entity_registry:catalog_reloaded`
+  with `cluster=True`; the other instances then reload as well.
+- **`health()`** only checks `SELECT 1` and counts open conflicts.
 
-## Rollen
+## Roles
 
-| Rolle | Rechte | Auto-Mapping |
+| Role | Permissions | Auto-mapping |
 |---|---|---|
-| `admin` | `api:read`, `api:write`, `registry:admin` | Gruppe `INT_ADMIN` |
+| `admin` | `api:read`, `api:write`, `registry:admin` | group `INT_ADMIN` |
 | `viewer` | `api:read` | — |
 
-## React-UI
+## React UI
 
-Route `/registry` (im Shell unter `/apps/lyndrix-plugin-entity_registry/registry`). Deep-Link auf
-eine Entität: `?uuid=<uuid>`. Ansichten: Liste mit Typ-/Status-Filter und Suche, Detail
-(Identifier, Attribute, Beziehungen, „gesehen von“, Merge, Stilllegen), Konfliktwarteschlange mit
-„Diese behalten, andere zusammenführen“ bzw. „Verwerfen“.
+Route `/registry` (in the shell under `/apps/lyndrix-plugin-entity_registry/registry`). Deep link to
+an entity: `?uuid=<uuid>`. Views: list with type/status filter and search, detail
+(identifiers, attributes, relations, "seen by", merge, retire), conflict queue with
+"Keep this one, merge the others" resp. "Dismiss".
 
-Ein CI in Wartung trägt in Liste und Detail-Kopfzeile das Badge **Wartung** (Klasse
-`lx-badge--maintenance`, Farbtoken `--lx-state-maintenance`; ältere Shells fallen auf die
-Paused-Farbe zurück). Der Listenfilter „Nur in Wartung“ nutzt `?in_maintenance=true`. Die
-Detailkarte **Wartung** zeigt aktuelles Fenster bzw. Override (mit Ende und Grund), das nächste
-Fenster, die aktiven Overrides, die veröffentlichten Fenster je Quelle samt `inherited_from`,
-die Incident-Regel und die Deploy-Policy — oder den Hinweis, dass der Core Fenster nicht
-auswerten kann.
+A CI in maintenance carries the **Maintenance** badge in the list and in the detail header (class
+`lx-badge--maintenance`, colour token `--lx-state-maintenance`; older shells fall back to the
+paused colour). The list filter "Only in maintenance" uses `?in_maintenance=true`. The detail card
+**Maintenance** shows the current window or override (with end and reason), the next window, the
+active overrides, the published windows per source including `inherited_from`, the incident rule
+and the deploy policy — or the note that the core cannot evaluate windows.
 
-Ist das ITSM-Plugin geladen, zeigt die Detailansicht zusätzlich die Karte **Service Management**:
-die offenen Datensätze, die dieses CI referenzieren (Link in den Datensatz), „Neuer Incident“
-(öffnet das ITSM-Formular mit dem CI als *betroffen* vorbelegt — `/apps/lyndrix-plugin-itsm/itsm?new=incident&ci=<uuid>`)
-und „Alle Datensätze“ (`?ci=<uuid>`). Ohne ITSM-Plugin oder -Berechtigung bleibt die Karte
-einfach weg.
+If the ITSM plugin is loaded, the detail view additionally shows the card **Service Management**:
+the open records that reference this CI (link into the record), "New incident"
+(opens the ITSM form with the CI pre-filled as *affected* — `/apps/lyndrix-plugin-itsm/itsm?new=incident&ci=<uuid>`)
+and "All records" (`?ci=<uuid>`). Without the ITSM plugin or permission the card simply does not appear.
 
-## Entwicklung & Tests
+## Development & tests
 
 ```bash
-# aus dem Plugin-Verzeichnis
-npm install && npm run build          # React-Bundle → app/ui/static/ui_bundle.js
+# from the plugin directory
+npm install && npm run build          # React bundle → app/ui/static/ui_bundle.js
 ruff check entrypoint.py app tests
 
-# Tests brauchen den Core auf dem PYTHONPATH — am einfachsten im Dev-Container:
+# Tests need the core on the PYTHONPATH — easiest in the dev container:
 docker cp . lyndrix-core-dev:/tmp/er
 docker exec -w /tmp/er -e PYTHONPATH=/app:/tmp/pytest-sm:/tmp/er \
   -e LYNDRIX_CLUSTER_MODE=single -e LYNDRIX_COORDINATOR=local \
   lyndrix-core-dev python -m pytest -q tests
 ```
 
-`tests/conftest.py` importiert `core.services` vor `core.api` (umgeht einen zirkulären Import im
-Core) und stellt die Fixtures `svc` (Service gegen SQLite im Speicher, Fremdschlüssel aktiv),
-`entrypoint` (lädt `entrypoint.py` wie der Core als Paketmitglied) und `bus` (führt `setup()`
-gegen einen aufzeichnenden Kontext aus → Bus-Handler je Topic). `tests/test_maintenance.py`
-deckt das Wartungs-Read-Model samt Handlern und dem Pfad ohne Core-Bibliothek
-(`monkeypatch` auf `maintenance.mw = None`) ab. `(scheme, value) IN (...)` wurde zusätzlich
-gegen MariaDB geprüft.
+`tests/conftest.py` imports `core.services` before `core.api` (works around a circular import in
+the core) and provides the fixtures `svc` (service against in-memory SQLite, foreign keys enabled),
+`entrypoint` (loads `entrypoint.py` like the core does as a package member) and `bus` (runs
+`setup()` against a recording context → bus handlers per topic). `tests/test_maintenance.py`
+covers the maintenance read model including the handlers and the path without the core library
+(`monkeypatch` on `maintenance.mw = None`). `(scheme, value) IN (...)` was additionally verified
+against MariaDB.
 
-## Grenzen (Phase 1)
+## Limits (phase 1)
 
-- Kein hartes Löschen über die API — nur `retire` und `merge` (Audit-Spur bleibt).
-- Konflikte werden nur gemeldet, nie automatisch aufgelöst.
-- Beziehungen sind einfache Kanten ohne Attribute; Graph-Darstellung ist eine Liste.
+- No hard deletion via the API — only `retire` and `merge` (audit trail remains).
+- Conflicts are only reported, never resolved automatically.
+- Relations are simple edges without attributes; graph display is a list.
